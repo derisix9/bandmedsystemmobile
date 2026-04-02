@@ -127,7 +127,9 @@ class BandmedChart {
 
     const textCol = (BandmedChart.defaults&&BandmedChart.defaults.color)||'#8BA7C7';
     const gridCol = 'rgba(30,58,95,0.5)';
-    const fnt = '10px Segoe UI,system-ui,sans-serif';
+    // Usar fonte menor para muitos labels (ex: 31 dias do mês)
+    const lblFontSz = n > 15 ? 8 : 10;
+    const fnt = `${lblFontSz}px Segoe UI,system-ui,sans-serif`;
     ctx.font = fnt;
 
     // Measure labels
@@ -136,9 +138,10 @@ class BandmedChart {
       : 36;
 
     const ml = maxLabelW;
-    const mr = 14;
+    const mr = 10;
     const mt = 22; // legend area
-    const mb = isHoriz ? 28 : 40;
+    // Margem inferior maior para labels não serem cortados
+    const mb = isHoriz ? 28 : (n > 15 ? 36 : 40);
     const pW = Math.max(10, W-ml-mr);
     const pH = Math.max(10, H-mt-mb);
 
@@ -206,10 +209,12 @@ class BandmedChart {
       });
     });
 
-    // Axis labels
+    // Axis labels — para muitos labels (dias do mês), mostrar a cada 2 para não sobrepor
     ctx.font = fnt;
     ctx.fillStyle = textCol;
     labels.forEach((lbl,li)=>{
+      // Se muitos labels, mostrar apenas alguns para evitar sobreposição
+      if(!isHoriz && n > 20 && li % 2 !== 0) return;
       const s   = String(lbl);
       const ctr = (isHoriz?mt:ml) + li*slot + slot/2;
       if(isHoriz){
@@ -859,6 +864,7 @@ global.BandmedChart = BandmedChart;
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="app.js"></script>
 <script>
 (function(){

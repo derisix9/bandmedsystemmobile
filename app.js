@@ -370,14 +370,30 @@ const XLSXio = (() => {
       return result;
     }
 
-    /* ── 1. Shared Strings ── */
+    /* ── 1. Shared Strings — tokenizer sem regex para suportar SS grandes ── */
     const ssList = [];
     const ssXml = getText(getFile('xl/sharedStrings.xml'));
     if(ssXml){
-      for(const siInner of blocks(ssXml,'si')){
-        // Rich-text: concatenar todos os <t>
-        const tMatches = [...siInner.matchAll(/<t(?:\s[^>]*)?>([^<]*)<\/t>/gi)];
-        ssList.push(unesc(tMatches.map(m=>m[1]).join('')));
+      // Tokenizer character-by-character — sem backtracking
+      let inSi=false, inT=false, parts=[], si=0, ssLen=ssXml.length;
+      while(si<ssLen){
+        if(ssXml[si]==='<'){
+          let end=si+1; while(end<ssLen&&ssXml[end]!=='>') end++;
+          const raw=ssXml.slice(si+1,end).trim();
+          si=end+1;
+          if(raw.startsWith('!')||raw.startsWith('?')) continue;
+          const isClose=raw.startsWith('/');
+          const name=(isClose?raw.slice(1):raw).split(/[\s/]/)[0].toLowerCase().replace(/^[\w]+:/,'');
+          if(!isClose&&name==='si'){inSi=true;parts=[];}
+          else if(isClose&&name==='si'){if(inSi)ssList.push(parts.join(''));inSi=false;inT=false;}
+          else if(!isClose&&name==='t'&&inSi) inT=true;
+          else if(isClose&&name==='t') inT=false;
+        } else {
+          const end=ssXml.indexOf('<',si);
+          const text=end===-1?ssXml.slice(si):ssXml.slice(si,end);
+          if(inT&&inSi) parts.push(text);
+          si=end===-1?ssLen:end;
+        }
       }
     }
 
@@ -418,80 +434,78 @@ const XLSXio = (() => {
     }
 
     /* ── 4. Ler cada folha ── */
+    /* ── Tokenizer XML sem regex — suporta 100.000+ linhas ── */
+    function xmlTok(xml) {
+      const tokens = []; const len = xml.length; let i = 0;
+      while (i < len) {
+        if (xml[i] === '<') {
+          let end = i + 1; let inStr = false; let sc = '';
+          while (end < len) { const c = xml[end]; if (inStr){if(c===sc)inStr=false;} else if(c==='"'||c==="'"){inStr=true;sc=c;} else if(c==='>') break; end++; }
+          const raw = xml.slice(i+1, end).trim(); i = end + 1;
+          if (raw.startsWith('!')||raw.startsWith('?')) continue;
+          const isSelf = raw.endsWith('/'); const isClose = raw.startsWith('/');
+          const body = isClose ? raw.slice(1) : (isSelf ? raw.slice(0,-1) : raw);
+          const sp = body.search(/[\s/]/); const name = (sp===-1?body:body.slice(0,sp)).toLowerCase().replace(/^[\w]+:/,'');
+          const aStr = sp===-1?'':body.slice(sp); const attrs = {};
+          const aRe = /([\w:]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g; let am;
+          while((am=aRe.exec(aStr))!==null){ const k=am[1].toLowerCase().replace(/^[\w]+:/,''); attrs[k]=am[2]!==undefined?am[2]:am[3]; }
+          if (isClose) tokens.push({type:'close',name}); else if(isSelf) tokens.push({type:'self',name,attrs}); else tokens.push({type:'open',name,attrs});
+        } else {
+          const end = xml.indexOf('<',i); const text = end===-1?xml.slice(i):xml.slice(i,end);
+          if(text) tokens.push({type:'text',text}); i=end===-1?len:end;
+        }
+      }
+      return tokens;
+    }
+
     function readSheet(wsPath, idx){
       const wsXml = getText(getFile(wsPath) || getFile(`xl/worksheets/sheet${idx+1}.xml`));
       if(!wsXml) return [];
+      const tokens = xmlTok(wsXml);
+      const rows = [];
+      let inSD = false, curRow = null, curCellRef = '', curCellType = '';
+      let readV = false, readIS = false, curText = '', curCell = null;
 
-      /* Extrair apenas o bloco <sheetData>…</sheetData> para eficiência */
-      const sdM = wsXml.match(/<sheetData[^>]*>([\s\S]*?)<\/sheetData>/i);
-      const sheetData = sdM ? sdM[1] : wsXml;
+      for (const tok of tokens) {
+        if (!inSD) { if(tok.type==='open'&&tok.name==='sheetdata') inSD=true; continue; }
+        if (tok.type==='close'&&tok.name==='sheetdata') break;
 
-      const grid = {};   // {rowIdx: {colIdx: value}}
-
-      /* Iterar sobre linhas */
-      const rowRe = /<row\s([^>]*)>([\s\S]*?)<\/row>/gi;
-      let rowM;
-      while((rowM=rowRe.exec(sheetData))!==null){
-        const rAttr = attr(rowM[1],'r');
-        const ri    = rAttr ? parseInt(rAttr,10)-1 : -1;
-        if(ri<0) continue;
-        if(!grid[ri]) grid[ri]={};
-
-        /* Iterar sobre células dentro da linha */
-        const cellRe = /<c\s([^>]*)(?:\/?>|>([\s\S]*?)<\/c>)/gi;
-        let cM;
-        while((cM=cellRe.exec(rowM[2]))!==null){
-          const cTag   = cM[1];
-          const cInner = cM[2]||'';
-          const ref    = attr(cTag,'r');
-          const t      = attr(cTag,'t');
-
-          /* Converter referência (ex: "AB12") em índice de coluna */
-          const colStr = ref.replace(/[0-9]/g,'').toUpperCase();
-          if(!colStr) continue;
-          let ci=0;
-          for(let k=0;k<colStr.length;k++) ci=ci*26+(colStr.charCodeAt(k)-64);
-          ci--;
-
-          /* Valor da célula */
-          let val = '';
-
-          if(t==='inlineStr'){
-            const tM = cInner.match(/<is[^>]*>[\s\S]*?<t[^>]*>([^<]*)<\/t>/i);
-            val = tM ? unesc(tM[1]) : '';
-          } else if(t==='s'){
-            /* Shared string */
-            const vM = cInner.match(/<v[^>]*>(\d+)<\/v>/i);
-            if(vM) val = ssList[parseInt(vM[1],10)] ?? '';
-          } else if(t==='b'){
-            const vM = cInner.match(/<v[^>]*>([^<]+)<\/v>/i);
-            val = vM ? vM[1].trim()==='1' : false;
-          } else {
-            /* Número, data, string de fórmula (t='str') ou sem tipo */
-            const vM = cInner.match(/<v[^>]*>([^<]*)<\/v>/i);
-            if(vM){
-              const raw = vM[1].trim();
-              if(raw!==''){
-                const n = Number(raw);
-                val = isNaN(n) ? unesc(raw) : n;
-              }
-            }
-          }
-          grid[ri][ci] = val;
-        }
+        if (tok.type==='open'&&tok.name==='row') {
+          const r=parseInt(tok.attrs.r||'0',10); if(r>0){curRow={ri:r-1,cells:{}}; rows.push(curRow);}
+        } else if(tok.type==='close'&&tok.name==='row') {
+          curRow=null;
+        } else if((tok.type==='open'||tok.type==='self')&&tok.name==='c') {
+          curCellRef=tok.attrs.r||''; curCellType=tok.attrs.t||''; curText=''; curCell=null; readV=false; readIS=false;
+          if(tok.type==='self'&&curRow&&curCellRef){const colS=curCellRef.replace(/[0-9]/g,'').toUpperCase();let ci=0;for(let k=0;k<colS.length;k++)ci=ci*26+(colS.charCodeAt(k)-64);curRow.cells[ci-1]='';}
+        } else if(tok.type==='close'&&tok.name==='c') {
+          if(curRow&&curCellRef){const colS=curCellRef.replace(/[0-9]/g,'').toUpperCase();let ci=0;for(let k=0;k<colS.length;k++)ci=ci*26+(colS.charCodeAt(k)-64);curRow.cells[ci-1]=curCell!==null?curCell:'';}
+          curCellRef=''; curCell=null; readV=false; readIS=false;
+        } else if(tok.type==='open'&&tok.name==='v') { readV=true; curText=''; }
+        else if(tok.type==='close'&&tok.name==='v') {
+          readV=false;
+          if(curCellType==='s'){const idx2=parseInt(curText,10);curCell=isNaN(idx2)?'':(ssList[idx2]??'');}
+          else if(curCellType==='b'){curCell=curText.trim()==='1';}
+          else if(curCellType==='str'){curCell=unesc(curText);}
+          else{const n=Number(curText.trim());curCell=(curText.trim()!==''&&!isNaN(n))?n:unesc(curText);}
+        } else if(tok.type==='open'&&tok.name==='is') { readIS=true; curText=''; }
+        else if(tok.type==='close'&&tok.name==='is') { readIS=false; curCell=unesc(curText); }
+        else if(tok.type==='text'&&(readV||readIS)) { curText+=tok.text; }
       }
 
-      const rowIdxs = Object.keys(grid).map(Number).sort((a,b)=>a-b);
-      if(!rowIdxs.length) return [];
-      const maxCols = Math.max(...rowIdxs.map(r=>Math.max(-1,...Object.keys(grid[r]).map(Number))))+1;
-      const toArr = ri => { const a=[]; for(let c=0;c<maxCols;c++) a.push(grid[ri]?.[c]??''); return a; };
-      const hdr = toArr(rowIdxs[0]).map(h=>String(h??'').trim());
-      if(!hdr.some(h=>h!=='')) return []; // sem cabeçalho válido
-      return rowIdxs.slice(1).map(ri=>{
-        const arr=toArr(ri); const obj={};
-        hdr.forEach((h,ci)=>{ if(h!=='') obj[h]=arr[ci]??''; });
-        return obj;
-      }).filter(o=>Object.values(o).some(v=>v!==''&&v!==null&&v!==undefined));
+      if (!rows.length) return [];
+      let maxCol = 0;
+      for (const row of rows) for (const ci of Object.keys(row.cells)) { const n=Number(ci); if(n+1>maxCol) maxCol=n+1; }
+      if (!maxCol) return [];
+      const hdrRow = rows[0]; const headers = [];
+      for (let c=0;c<maxCol;c++) headers.push(String(hdrRow.cells[c]??'').trim());
+      if (!headers.some(h=>h!=='')) return [];
+      const result = [];
+      for (let i=1;i<rows.length;i++) {
+        const row=rows[i]; const obj={}; let hasVal=false;
+        for (let c=0;c<headers.length;c++) { const h=headers[c]; const v=row.cells[c]??''; if(h!==''){obj[h]=v; if(v!==''&&v!==null&&v!==undefined)hasVal=true;} }
+        if(hasVal) result.push(obj);
+      }
+      return result;
     }
 
     /* ── 5. Montar resultado ── */
@@ -531,30 +545,18 @@ const XLSX_WORKER_CODE = `
 'use strict';
 const dec = new TextDecoder();
 
-// ── DEFLATE via pipeThrough (método correcto, sem deadlock, funciona no Chrome mobile) ──
+// ── DEFLATE via DecompressionStream ──
 async function inflateRaw(data) {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-
-  // Método 1: pipeThrough com Blob.stream() — sem deadlock, suportado no Chrome 103+ mobile
-  if (typeof DecompressionStream !== 'undefined' && typeof Response !== 'undefined') {
-    try {
-      const blob = new Blob([bytes]);
-      const stream = blob.stream().pipeThrough(new DecompressionStream('deflate-raw'));
-      const buf = await new Response(stream).arrayBuffer();
-      return new Uint8Array(buf);
-    } catch(e1) {
-      // Tentar com cabeçalho zlib (alguns ficheiros usam deflate em vez de deflate-raw)
+  if (typeof DecompressionStream !== 'undefined') {
+    for (const fmt of ['deflate-raw','deflate']) {
       try {
         const blob = new Blob([bytes]);
-        const stream = blob.stream().pipeThrough(new DecompressionStream('deflate'));
+        const stream = blob.stream().pipeThrough(new DecompressionStream(fmt));
         const buf = await new Response(stream).arrayBuffer();
         return new Uint8Array(buf);
-      } catch(e2) {}
+      } catch(e) {}
     }
-  }
-
-  // Método 2: write/read manual com Promise.all (fallback)
-  if (typeof DecompressionStream !== 'undefined') {
     try {
       const ds = new DecompressionStream('deflate-raw');
       const writer = ds.writable.getWriter();
@@ -568,12 +570,10 @@ async function inflateRaw(data) {
       if(out.length > 0) return out;
     } catch(e3) {}
   }
-
-  // Método 3: DEFLATE puro JS (último recurso — lento mas funcional)
   return inflatePure(bytes);
 }
 
-// ── DEFLATE puro (fallback) ──
+// ── DEFLATE puro JS (fallback) ──
 function inflatePure(data) {
   const src = data instanceof Uint8Array ? data : new Uint8Array(data);
   let pos=0,bits=0,buf=0;
@@ -653,7 +653,7 @@ async function zipRead(buf){
   const v=new DataView(b.buffer,b.byteOffset,b.byteLength);
   let ep=-1;
   for(let i=b.length-22;i>=0;i--){if(b[i]===0x50&&b[i+1]===0x4B&&b[i+2]===0x05&&b[i+3]===0x06){ep=i;break;}}
-  if(ep<0) throw new Error('ZIP inválido');
+  if(ep<0) throw new Error('ZIP invalido');
   const cnt=v.getUint16(ep+8,true), cdOff=v.getUint32(ep+16,true);
   const files=new Map(); let p=cdOff;
   for(let i=0;i<cnt;i++){
@@ -670,123 +670,286 @@ async function zipRead(buf){
   return files;
 }
 
-// ── Leitor XLSX via Regex (sem DOMParser) ──
-async function readXLSX(arrayBuffer){
-  const files = await zipRead(new Uint8Array(arrayBuffer));
-
-  function getText(bytes){ try{ return bytes&&bytes.length?dec.decode(bytes):''; }catch(e){return '';} }
-
-  function getFile(path){
-    if(files.has(path)) return files.get(path);
-    const lc=path.toLowerCase().replace(/\\\\/g,'/');
-    for(const[k,v] of files.entries()) if(k.toLowerCase().replace(/\\\\/g,'/')===lc) return v;
-    const fn=path.split('/').pop().toLowerCase();
-    for(const[k,v] of files.entries()) if(k.split('/').pop().toLowerCase()===fn) return v;
-    return null;
+// ── XML tokenizer sem regex — lida com 100.000+ linhas ──
+function xmlTokenize(xml) {
+  // Retorna array de tokens: {type:'open'|'close'|'self'|'text', name, attrs:{}, text}
+  const tokens = [];
+  const len = xml.length;
+  let i = 0;
+  while (i < len) {
+    if (xml[i] === '<') {
+      // tag
+      const start = i + 1;
+      // procurar fim da tag
+      let end = i + 1;
+      let inStr = false;
+      let strChar = '';
+      while (end < len) {
+        const c = xml[end];
+        if (inStr) { if (c === strChar) inStr = false; }
+        else if (c === '"' || c === "'") { inStr = true; strChar = c; }
+        else if (c === '>') break;
+        end++;
+      }
+      const raw = xml.slice(start, end).trim();
+      i = end + 1;
+      if (raw.startsWith('!') || raw.startsWith('?')) continue;
+      const isSelf = raw.endsWith('/');
+      const isClose = raw.startsWith('/');
+      const content = isClose ? raw.slice(1) : (isSelf ? raw.slice(0,-1) : raw);
+      // parse name and attrs
+      const spIdx = content.search(/[\s/]/);
+      const name = (spIdx === -1 ? content : content.slice(0, spIdx)).toLowerCase().replace(/^[\w]+:/,'');
+      const attrStr = spIdx === -1 ? '' : content.slice(spIdx);
+      const attrs = {};
+      const attrRe = /([\w:]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+      let am;
+      while ((am = attrRe.exec(attrStr)) !== null) {
+        const key = am[1].toLowerCase().replace(/^[\w]+:/,'');
+        attrs[key] = am[2] !== undefined ? am[2] : am[3];
+      }
+      if (isClose) tokens.push({type:'close', name});
+      else if (isSelf) tokens.push({type:'self', name, attrs});
+      else tokens.push({type:'open', name, attrs});
+    } else {
+      // text node
+      const end = xml.indexOf('<', i);
+      const text = end === -1 ? xml.slice(i) : xml.slice(i, end);
+      if (text) tokens.push({type:'text', text});
+      i = end === -1 ? len : end;
+    }
   }
+  return tokens;
+}
 
-  function unesc(s){ return String(s||'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#(\\d+);/g,(_,n)=>String.fromCharCode(+n)); }
-
-  function attr(tag,name){
-    const re=new RegExp('(?:^|\\\\s)(?:[\\\\w]+:)?'+name+'\\\\s*=\\\\s*"([^"]*)"','i');
-    const m=tag.match(re); return m?unesc(m[1]):'';
+// ── Parsear sharedStrings.xml ──
+function parseSharedStrings(xml) {
+  const list = [];
+  const tokens = xmlTokenize(xml);
+  let inSi = false, inT = false, curParts = [];
+  for (const tok of tokens) {
+    if (tok.type === 'open' && tok.name === 'si') { inSi = true; curParts = []; }
+    else if (tok.type === 'close' && tok.name === 'si') { list.push(curParts.join('')); inSi = false; inT = false; }
+    else if (inSi && tok.type === 'open' && tok.name === 't') inT = true;
+    else if (inSi && tok.type === 'close' && tok.name === 't') inT = false;
+    else if (inSi && inT && tok.type === 'text') curParts.push(tok.text);
+    else if (inSi && tok.type === 'self' && tok.name === 't') {} // vazio
   }
+  return list;
+}
 
-  // Shared strings
-  const ssList=[];
-  const ssXml=getText(getFile('xl/sharedStrings.xml'));
-  if(ssXml){
-    const siRe=/<si(?:\\s[^>]*)?>([\\s\\S]*?)<\\/si>/gi; let sm;
-    while((sm=siRe.exec(ssXml))!==null){
-      const tMs=[...sm[1].matchAll(/<t(?:\\s[^>]*)?>([^<]*)<\\/t>/gi)];
-      ssList.push(unesc(tMs.map(m=>m[1]).join('')));
+// ── Descodificar entidades XML ──
+function unesc(s) {
+  return String(s||'')
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&quot;/g,'"').replace(/&apos;/g,"'")
+    .replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(+n));
+}
+
+// ── Converter referência de célula (ex: "AB12") em índice de coluna ──
+function colToIdx(ref) {
+  const colStr = ref.replace(/[0-9]/g,'').toUpperCase();
+  let ci = 0;
+  for (let k = 0; k < colStr.length; k++) ci = ci * 26 + (colStr.charCodeAt(k) - 64);
+  return ci - 1;
+}
+
+// ── Parsear uma folha de cálculo usando tokenizer ──
+function parseSheet(xml, ssList) {
+  if (!xml) return [];
+  const tokens = xmlTokenize(xml);
+  const rows = []; // array de {ri, cells:{ci:val}}
+  let inSheetData = false;
+  let curRow = null;
+  let curCell = null;
+  let curCellType = '';
+  let curCellRef = '';
+  let readingV = false;
+  let readingInlineStr = false;
+  let curText = '';
+
+  for (const tok of tokens) {
+    if (!inSheetData) {
+      if (tok.type === 'open' && tok.name === 'sheetdata') inSheetData = true;
+      continue;
+    }
+    if (tok.type === 'close' && tok.name === 'sheetdata') break;
+
+    if (tok.type === 'open' && tok.name === 'row') {
+      const r = parseInt(tok.attrs.r || '0', 10);
+      if (r > 0) { curRow = { ri: r - 1, cells: {} }; rows.push(curRow); }
+    } else if (tok.type === 'close' && tok.name === 'row') {
+      curRow = null;
+    } else if ((tok.type === 'open' || tok.type === 'self') && tok.name === 'c') {
+      curCellRef = tok.attrs.r || '';
+      curCellType = tok.attrs.t || '';
+      curCell = null; curText = ''; readingV = false; readingInlineStr = false;
+      if (tok.type === 'self') {
+        // empty cell
+        if (curRow && curCellRef) {
+          const ci = colToIdx(curCellRef);
+          if (ci >= 0) curRow.cells[ci] = '';
+        }
+        curCellRef = '';
+      }
+    } else if (tok.type === 'close' && tok.name === 'c') {
+      if (curRow && curCellRef) {
+        const ci = colToIdx(curCellRef);
+        if (ci >= 0) curRow.cells[ci] = curCell !== null ? curCell : '';
+      }
+      curCell = null; curText = ''; readingV = false; readingInlineStr = false; curCellRef = '';
+    } else if (tok.type === 'open' && tok.name === 'v') {
+      readingV = true; curText = '';
+    } else if (tok.type === 'close' && tok.name === 'v') {
+      readingV = false;
+      if (curCellType === 's') {
+        const idx = parseInt(curText, 10);
+        curCell = isNaN(idx) ? '' : (ssList[idx] ?? '');
+      } else if (curCellType === 'b') {
+        curCell = curText.trim() === '1';
+      } else if (curCellType === 'str') {
+        curCell = unesc(curText);
+      } else {
+        const n = Number(curText.trim());
+        curCell = (curText.trim() !== '' && !isNaN(n)) ? n : unesc(curText);
+      }
+    } else if (tok.type === 'open' && tok.name === 'is') {
+      readingInlineStr = true; curText = '';
+    } else if (tok.type === 'close' && tok.name === 'is') {
+      readingInlineStr = false;
+      curCell = unesc(curText);
+    } else if (tok.type === 'open' && tok.name === 't') {
+      curText = '';
+    } else if (tok.type === 'close' && tok.name === 't') {
+      // handled by text node
+    } else if (tok.type === 'text') {
+      if (readingV || readingInlineStr) curText += tok.text;
     }
   }
 
-  // Relações
-  const sheetFiles=new Map();
-  const relXml=getText(getFile('xl/_rels/workbook.xml.rels'));
-  if(relXml){
-    const rRe=/<[Rr]elationship\\s([^/?>]+)/gi; let rm;
-    while((rm=rRe.exec(relXml))!==null){
-      const id=attr(rm[1],'Id'), target=attr(rm[1],'Target'), type=attr(rm[1],'Type');
-      if(!id||!target) continue;
-      if(type.includes('worksheet')||target.toLowerCase().includes('sheet')){
-        let path=target;
-        if(path.startsWith('/'))path=path.slice(1);
-        else if(!path.startsWith('xl/'))path='xl/'+path;
-        sheetFiles.set(id,path);
+  if (!rows.length) return [];
+
+  // Determinar max coluna
+  let maxCol = 0;
+  for (const row of rows) {
+    for (const ci of Object.keys(row.cells)) {
+      const n = Number(ci);
+      if (n + 1 > maxCol) maxCol = n + 1;
+    }
+  }
+  if (maxCol === 0) return [];
+
+  // Extrair cabeçalho
+  const hdrRow = rows[0];
+  const headers = [];
+  for (let c = 0; c < maxCol; c++) {
+    headers.push(String(hdrRow.cells[c] ?? '').trim());
+  }
+  if (!headers.some(h => h !== '')) return [];
+
+  // Converter linhas restantes para objectos
+  const result = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const obj = {};
+    let hasValue = false;
+    for (let c = 0; c < headers.length; c++) {
+      const h = headers[c];
+      const val = row.cells[c] ?? '';
+      if (h !== '') {
+        obj[h] = val;
+        if (val !== '' && val !== null && val !== undefined) hasValue = true;
+      }
+    }
+    if (hasValue) result.push(obj);
+  }
+  return result;
+}
+
+// ── Leitura principal do XLSX ──
+async function readXLSX(arrayBuffer) {
+  const files = await zipRead(new Uint8Array(arrayBuffer));
+
+  function getText(bytes) {
+    try { return bytes && bytes.length ? dec.decode(bytes) : ''; } catch(e) { return ''; }
+  }
+  function getFile(path) {
+    if (files.has(path)) return files.get(path);
+    const lc = path.toLowerCase().replace(/\\\\/g,'/');
+    for (const [k,v] of files.entries()) {
+      if (k.toLowerCase().replace(/\\\\/g,'/') === lc) return v;
+    }
+    const fn = path.split('/').pop().toLowerCase();
+    for (const [k,v] of files.entries()) {
+      if (k.split('/').pop().toLowerCase() === fn) return v;
+    }
+    return null;
+  }
+
+  // Shared strings
+  const ssXml = getText(getFile('xl/sharedStrings.xml'));
+  const ssList = ssXml ? parseSharedStrings(ssXml) : [];
+
+  // Relações das folhas
+  const sheetFiles = new Map();
+  const relXml = getText(getFile('xl/_rels/workbook.xml.rels'));
+  if (relXml) {
+    const rRe = /<[Rr]elationship\s([^/?>]+)/gi; let rm;
+    while ((rm = rRe.exec(relXml)) !== null) {
+      const idM = rm[1].match(/\bId\s*=\s*"([^"]*)"/i);
+      const tgtM = rm[1].match(/\bTarget\s*=\s*"([^"]*)"/i);
+      const typeM = rm[1].match(/\bType\s*=\s*"([^"]*)"/i);
+      if (!idM || !tgtM) continue;
+      const type = typeM ? typeM[1] : '';
+      const target = tgtM[1];
+      if (type.includes('worksheet') || target.toLowerCase().includes('sheet')) {
+        let path = target;
+        if (path.startsWith('/')) path = path.slice(1);
+        else if (!path.startsWith('xl/')) path = 'xl/' + path;
+        sheetFiles.set(idM[1], path);
       }
     }
   }
 
   // Nomes das folhas
-  const wbXml=getText(getFile('xl/workbook.xml'));
-  if(!wbXml) return {};
-  const sheetDefs=[];
-  const stRe=/<[Ss]heet\\s([^/?>]+)/gi; let stm;
-  while((stm=stRe.exec(wbXml))!==null){
-    const tag=stm[1];
-    const name=attr(tag,'name')||('Sheet'+(sheetDefs.length+1));
-    const rId=attr(tag,'r:id')||attr(tag,'id')||('rId'+(sheetDefs.length+1));
-    sheetDefs.push({name,rId});
+  const wbXml = getText(getFile('xl/workbook.xml'));
+  if (!wbXml) return {};
+  const sheetDefs = [];
+  const stRe = /<[Ss]heet\s([^/?>]+)/gi; let stm;
+  while ((stm = stRe.exec(wbXml)) !== null) {
+    const tag = stm[1];
+    const nameM = tag.match(/\bname\s*=\s*"([^"]*)"/i);
+    const rIdM = tag.match(/\br:id\s*=\s*"([^"]*)"/i) || tag.match(/\brid\s*=\s*"([^"]*)"/i) || tag.match(/\bid\s*=\s*"([^"]*)"/i);
+    sheetDefs.push({
+      name: nameM ? nameM[1] : ('Sheet' + (sheetDefs.length+1)),
+      rId: rIdM ? rIdM[1] : ('rId' + (sheetDefs.length+1))
+    });
   }
 
-  // Ler cada folha
-  function readSheet(wsPath,idx){
-    const wsXml=getText(getFile(wsPath)||getFile('xl/worksheets/sheet'+(idx+1)+'.xml'));
-    if(!wsXml) return [];
-    const sdM=wsXml.match(/<sheetData[^>]*>([\\s\\S]*?)<\\/sheetData>/i);
-    const sd=sdM?sdM[1]:wsXml;
-    const grid={};
-    const rowRe=/<row\\s([^>]*)>([\\s\\S]*?)<\\/row>/gi; let rowM;
-    while((rowM=rowRe.exec(sd))!==null){
-      const ri=parseInt(attr(rowM[1],'r'),10)-1; if(ri<0)continue;
-      if(!grid[ri])grid[ri]={};
-      const cellRe=/<c\\s([^>]*)(?:\\/>|>([\\s\\S]*?)<\\/c>)/gi; let cM;
-      while((cM=cellRe.exec(rowM[2]))!==null){
-        const cTag=cM[1], cInner=cM[2]||'', t=attr(cTag,'t');
-        const ref=attr(cTag,'r'); const colStr=ref.replace(/[0-9]/g,'').toUpperCase();
-        if(!colStr)continue;
-        let ci=0; for(let k=0;k<colStr.length;k++)ci=ci*26+(colStr.charCodeAt(k)-64); ci--;
-        let val='';
-        if(t==='inlineStr'){ const m=cInner.match(/<t[^>]*>([^<]*)<\\/t>/i); val=m?unesc(m[1]):''; }
-        else if(t==='s'){ const m=cInner.match(/<v[^>]*>(\\d+)<\\/v>/i); if(m)val=ssList[parseInt(m[1],10)]??''; }
-        else if(t==='b'){ const m=cInner.match(/<v[^>]*>([^<]+)<\\/v>/i); val=m?m[1].trim()==='1':false; }
-        else { const m=cInner.match(/<v[^>]*>([^<]*)<\\/v>/i); if(m){const r=m[1].trim();if(r!==''){const n=Number(r);val=isNaN(n)?unesc(r):n;}} }
-        grid[ri][ci]=val;
-      }
-    }
-    const rix=Object.keys(grid).map(Number).sort((a,b)=>a-b);
-    if(!rix.length)return[];
-    const mc=Math.max(...rix.map(r=>Math.max(-1,...Object.keys(grid[r]).map(Number))))+1;
-    const toA=ri=>{const a=[];for(let c=0;c<mc;c++)a.push(grid[ri]?.[c]??'');return a;};
-    const hdr=toA(rix[0]).map(h=>String(h??'').trim());
-    if(!hdr.some(h=>h!==''))return[];
-    return rix.slice(1).map(ri=>{const arr=toA(ri);const obj={};hdr.forEach((h,ci)=>{if(h!=='')obj[h]=arr[ci]??'';});return obj;})
-      .filter(o=>Object.values(o).some(v=>v!==''&&v!==null&&v!==undefined));
+  const result = {};
+  for (let i = 0; i < sheetDefs.length; i++) {
+    const { name, rId } = sheetDefs[i];
+    const wsPath = sheetFiles.get(rId) || ('xl/worksheets/sheet' + (i+1) + '.xml');
+    const wsXml = getText(getFile(wsPath) || getFile('xl/worksheets/sheet' + (i+1) + '.xml'));
+    self.postMessage({ status: 'progress', msg: 'A processar folha "' + name + '" (' + (i+1) + '/' + sheetDefs.length + ')...' });
+    result[name] = parseSheet(wsXml, ssList);
   }
-
-  const result={};
-  sheetDefs.forEach(({name,rId},i)=>{
-    const wsPath=sheetFiles.get(rId)||('xl/worksheets/sheet'+(i+1)+'.xml');
-    result[name]=readSheet(wsPath,i);
-  });
   return result;
 }
 
 // ── Handler do Worker ──
-self.onmessage = async function(e){
+self.onmessage = async function(e) {
   try {
-    self.postMessage({status:'progress', msg:'A descomprimir ficheiro ZIP...'});
+    self.postMessage({ status: 'progress', msg: 'A descomprimir ficheiro ZIP...' });
     const sheets = await readXLSX(e.data);
-    self.postMessage({status:'progress', msg:'A converter para JSON...'});
+    self.postMessage({ status: 'progress', msg: 'A serializar JSON...' });
     const json = JSON.stringify(sheets);
-    self.postMessage({status:'done', json});
+    self.postMessage({ status: 'done', json });
   } catch(err) {
-    self.postMessage({status:'error', msg: err.message || 'Erro desconhecido'});
+    self.postMessage({ status: 'error', msg: err.message || 'Erro desconhecido' });
   }
 };
+
 `;
 
 /* Criar e reutilizar URL do worker */
@@ -831,8 +994,9 @@ function parseXLSXInWorker(arrayBuffer){
       worker.terminate();
       reject(new Error('Worker error: '+(e.message||'desconhecido')));
     };
-    // Transferir o ArrayBuffer para o worker (zero-copy)
-    worker.postMessage(arrayBuffer, [arrayBuffer]);
+    // NÃO transferir (não passar [arrayBuffer]) — o worker recebe uma cópia
+    // e o buffer original fica disponível para o fallback XLSXio.read()
+    worker.postMessage(arrayBuffer);
   });
 }
 // ===================== FIM XLSX WEB WORKER =====================
@@ -865,6 +1029,7 @@ const ICONS = {
   user:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
   users:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
   lock:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
+  unlock:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>`,
   eye_off:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`,
   refresh:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>`,
   calendar:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
@@ -944,10 +1109,695 @@ function toggleTheme() { applyTheme(appSettings.theme === 'light' ? 'dark' : 'li
 // ---- XLSX FILE DATABASE ----
 let xlsxDirHandle = null; // File System Access API directory handle
 const XLSX_DB_FILENAME = 'bandmed_database.xlsx';
-const DB_MODE_KEY = 'hmm_db_mode'; // 'localstorage' | 'xlsx'
+const DB_MODE_KEY = 'hmm_db_mode'; // 'localstorage' | 'xlsx' | 'indexeddb' | 'firebase'
 
 function getDbMode() { return localStorage.getItem(DB_MODE_KEY) || 'localstorage'; }
 function setDbMode(m) { localStorage.setItem(DB_MODE_KEY, m); }
+
+// ===================== INDEXEDDB BACKEND (suporta 12.000+ registos) =====================
+const IDB_NAME = 'BandMedGestDB';
+const IDB_STORE = 'data';
+const IDB_KEY = 'main';
+
+// Contador de escritas IDB em curso — usado pelo beforeunload para avisar o utilizador
+let _idbPending = 0;
+
+// Cache da conexão IDB para evitar abrir/fechar repetidamente
+let _idbConnectionPromise = null;
+
+function openIDB() {
+  if (_idbConnectionPromise) return _idbConnectionPromise;
+  _idbConnectionPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = (e) => {
+      const dbInst = e.target.result;
+      if (!dbInst.objectStoreNames.contains(IDB_STORE)) {
+        dbInst.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = (e) => {
+      const conn = e.target.result;
+      // Limpar cache se a ligação for fechada externamente
+      conn.onclose = () => { _idbConnectionPromise = null; };
+      conn.onversionchange = () => { conn.close(); _idbConnectionPromise = null; };
+      resolve(conn);
+    };
+    req.onerror = (e) => {
+      _idbConnectionPromise = null;
+      reject(e.target.error);
+    };
+    req.onblocked = () => {
+      _idbConnectionPromise = null;
+      reject(new Error('IndexedDB bloqueado por outra aba. Feche outras abas do sistema e tente novamente.'));
+    };
+  });
+  return _idbConnectionPromise;
+}
+
+async function saveToIDB(data) {
+  _idbPending++;
+  try {
+    const idb = await openIDB();
+    await new Promise((resolve, reject) => {
+      const tx = idb.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      // Cópia profunda para evitar erros de objectos não-serializáveis
+      const toSave = JSON.parse(JSON.stringify(data));
+      const req = store.put(toSave, IDB_KEY);
+      req.onerror = (e) => reject(e.target.error);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = (e) => reject(e.target.error);
+      tx.onabort = (e) => reject(e.target.error || new Error('Transacção IDB abortada'));
+    });
+    console.log('[IDB] Dados guardados com sucesso no IndexedDB.');
+  } catch(e) {
+    console.error('[IDB] Erro ao guardar:', e);
+    throw e;
+  } finally {
+    _idbPending = Math.max(0, _idbPending - 1);
+  }
+}
+
+async function loadFromIDB() {
+  try {
+    const idb = await openIDB();
+    return await new Promise((resolve, reject) => {
+      const tx = idb.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.get(IDB_KEY);
+      req.onsuccess = (e) => resolve(e.target.result || null);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  } catch(e) {
+    console.warn('[IDB] Erro ao carregar:', e);
+    return null;
+  }
+}
+
+async function clearIDB() {
+  try {
+    const idb = await openIDB();
+    return new Promise((resolve) => {
+      const tx = idb.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(IDB_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch(e) {
+    console.warn('[IDB] Erro ao limpar:', e);
+  }
+}
+
+// Verificar se o IDB tem dados guardados (sem carregar o payload completo)
+async function idbHasData() {
+  try {
+    const idb = await openIDB();
+    return await new Promise((resolve) => {
+      const tx = idb.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.count();
+      req.onsuccess = (e) => resolve(e.target.result > 0);
+      req.onerror = () => resolve(false);
+    });
+  } catch(e) { return false; }
+}
+
+// ===================== FIREBASE REALTIME DB (modo armazenamento) =====================
+let _firebaseStoreConfig = JSON.parse(localStorage.getItem('hmm_firebase_store_cfg') || 'null');
+
+function saveFirebaseStoreCfg(cfg) {
+  _firebaseStoreConfig = cfg;
+  localStorage.setItem('hmm_firebase_store_cfg', JSON.stringify(cfg));
+}
+function getFirebaseStoreCfg() {
+  return _firebaseStoreConfig || JSON.parse(localStorage.getItem('hmm_firebase_store_cfg') || 'null');
+}
+
+async function saveToFirebaseStore(data) {
+  const cfg = getFirebaseStoreCfg();
+  if (!cfg || !cfg.url) throw new Error('Firebase não configurado');
+  const url = `${cfg.url}/bandmed_data.json${cfg.key ? '?auth=' + cfg.key : ''}`;
+  const payload = JSON.parse(JSON.stringify(data));
+  const r = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) throw new Error('Firebase: erro HTTP ' + r.status);
+  return true;
+}
+
+async function loadFromFirebaseStore() {
+  const cfg = getFirebaseStoreCfg();
+  if (!cfg || !cfg.url) return null;
+  const url = `${cfg.url}/bandmed_data.json${cfg.key ? '?auth=' + cfg.key : ''}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+
+
+// ===================== NETWORK STATUS MANAGER =====================
+let _isOnline = navigator.onLine;
+
+function _netColor(online) { return online ? '#00b894' : '#e74c3c'; }
+function _netBg(online)    { return online ? 'rgba(0,184,148,0.12)' : 'rgba(231,76,60,0.12)'; }
+function _netBorder(online){ return online ? 'rgba(0,184,148,0.3)'  : 'rgba(231,76,60,0.25)'; }
+
+function updateNetworkStatusUI() {
+  const online = _isOnline;
+  const cfg = getCloudCfg ? getCloudCfg() : null;
+  const color = _netColor(online);
+  const bg    = _netBg(online);
+  const bdr   = _netBorder(online);
+
+  // ── Header badge ──
+  const hBadge = document.getElementById('header-net-badge');
+  const hDot   = document.getElementById('header-net-dot');
+  const hLabel = document.getElementById('header-net-label');
+  if (hBadge) { hBadge.style.background=bg; hBadge.style.color=color; hBadge.style.border='1px solid '+bdr; }
+  if (hDot)   { hDot.style.background=color; hDot.style.boxShadow='0 0 6px '+color+'99'; }
+  if (hLabel) {
+    if (online && cfg && getDbMode && getDbMode()==='cloud') hLabel.textContent = 'Online · ' + cloudDbTypeName(cfg.type);
+    else if (online) hLabel.textContent = 'Online';
+    else hLabel.textContent = 'Offline';
+  }
+
+  // ── Login screen status ──
+  const lDot   = document.getElementById('login-net-dot');
+  const lLabel = document.getElementById('login-net-label');
+  const lWrap  = document.getElementById('login-net-status');
+  if (lDot)   { lDot.style.background = color; lDot.style.boxShadow = '0 0 5px '+color+'88'; }
+  if (lLabel) {
+    if (online && cfg) lLabel.textContent = '☁️ Online · ' + cloudDbTypeName(cfg.type) + ' activo';
+    else if (online)   lLabel.textContent = '🌐 Online · Modo local activo';
+    else               lLabel.textContent = 'Offline · Dados armazenados localmente com segurança';
+  }
+  if (lWrap) lWrap.style.color = online ? color : 'var(--text-muted)';
+}
+
+async function handleGoOnline() {
+  _isOnline = true;
+  updateNetworkStatusUI();
+  const cfg = getCloudCfg();
+  const mode = getDbMode();
+  if (cfg && mode === 'cloud') {
+    toast('info', '🌐 Ligação restabelecida', 'A sincronizar dados locais com a nuvem...');
+    await syncLocalToCloud();
+  } else if (cfg && mode !== 'cloud') {
+    toast('info', '🌐 Internet detectada', 'Nuvem disponível — aceda a Base de Dados para reconectar.');
+  } else if (!cfg) {
+    // Online but no cloud config: offer wizard if not already open
+    if (!document.getElementById('cloud-setup-overlay')) {
+      toast('info', '🌐 Internet detectada', 'Configure a nuvem em Base de Dados para sincronizar dados.');
+    }
+  }
+}
+
+function handleGoOffline() {
+  _isOnline = false;
+  updateNetworkStatusUI();
+  if (getDbMode() === 'cloud') {
+    toast('warning', '🔴 Sem ligação à internet', 'Os dados serão guardados localmente e sincronizados quando a ligação for restabelecida.');
+  } else {
+    toast('warning', '🔴 Sem ligação à internet', 'A continuar em modo local.');
+  }
+}
+
+window.addEventListener('online',  () => handleGoOnline());
+window.addEventListener('offline', () => handleGoOffline());
+
+// ── Sincronizar dados locais → nuvem ──
+async function syncLocalToCloud() {
+  const cfg = getCloudCfg();
+  if (!cfg) return;
+  try {
+    await CloudDB.saveAll(db.data);
+    await CloudDB.saveUsers(db.data.usuarios);
+    // Pull merged cloud data back
+    const cloudData = await CloudDB.loadAll();
+    if (cloudData) {
+      const localUsers = db.data.usuarios;
+      db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...cloudData };
+      db.data.usuarios = localUsers.length ? localUsers : db.data.usuarios;
+    }
+    // Cache full data locally for offline fallback
+    try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
+      try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:db.data.usuarios})); } catch(e2) {}
+    }
+    toast('success', '✅ Sincronizado com a nuvem!', 'Todos os dados foram enviados e actualizados.');
+    // Refresh current page
+    if (currentPage && typeof navigateTo === 'function') navigateTo(currentPage);
+  } catch(e) {
+    toast('error', 'Sincronização falhou', 'Verifique a ligação e tente novamente. ' + e.message);
+  }
+}
+
+// ── Sincronizar nuvem → dados locais ──
+async function syncCloudToLocal() {
+  const cfg = getCloudCfg();
+  if (!cfg) return;
+  try {
+    toast('info', '☁️ A carregar dados da nuvem...');
+    const cloudData = await CloudDB.loadAll();
+    const cloudUsers = await CloudDB.loadUsers();
+    if (cloudData) {
+      db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...cloudData };
+    }
+    if (cloudUsers && cloudUsers.length) {
+      db.data.usuarios = cloudUsers;
+    }
+    try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
+      try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:db.data.usuarios})); } catch(e2) {}
+    }
+    toast('success', '☁️ Dados da nuvem carregados', 'Base de dados local actualizada com sucesso.');
+    if (currentPage && typeof navigateTo === 'function') navigateTo(currentPage);
+  } catch(e) {
+    toast('warning', 'Carregamento da nuvem falhou', 'A usar dados locais em cache.');
+  }
+}
+
+// ===================== CLOUD DATABASE (Universal: Firebase / Supabase / REST) =====================
+// Detecta automaticamente o tipo de BD a partir do URL.
+// Suportado: Firebase RTDB, Supabase, ou qualquer REST API com URL+Key.
+
+const CLOUD_CFG_KEY = 'hmm_cloud_cfg';
+let _cloudCfg = null;
+
+function getCloudCfg() {
+  if (_cloudCfg) return _cloudCfg;
+  try { _cloudCfg = JSON.parse(localStorage.getItem(CLOUD_CFG_KEY) || 'null'); return _cloudCfg; } catch { return null; }
+}
+function saveCloudCfg(cfg) {
+  _cloudCfg = cfg;
+  localStorage.setItem(CLOUD_CFG_KEY, JSON.stringify(cfg));
+}
+function clearCloudCfg() {
+  _cloudCfg = null;
+  localStorage.removeItem(CLOUD_CFG_KEY);
+}
+function detectCloudDbType(url) {
+  if (!url) return 'generic';
+  const u = url.toLowerCase();
+  if (u.includes('firebaseio.com')) return 'firebase';
+  if (u.includes('supabase.co') || u.includes('supabase.io')) return 'supabase';
+  return 'generic';
+}
+function cloudDbTypeName(type) {
+  return type === 'firebase' ? 'Firebase RTDB' : type === 'supabase' ? 'Supabase' : 'Base de Dados REST';
+}
+
+// ── Adaptador Cloud DB ──────────────────────────────────────────────
+const CloudDB = {
+  get cfg() { return getCloudCfg(); },
+
+  _head(extra) {
+    const cfg = this.cfg || {};
+    const h = { 'Content-Type': 'application/json' };
+    if (cfg.type === 'supabase' && cfg.key) {
+      h['apikey'] = cfg.key;
+      h['Authorization'] = 'Bearer ' + cfg.key;
+    } else if (cfg.key) {
+      h['Authorization'] = 'Bearer ' + cfg.key;
+    }
+    return extra ? { ...h, ...extra } : h;
+  },
+
+  _url(path) {
+    const cfg = this.cfg || {};
+    if (cfg.type === 'firebase') return `${cfg.url}/${path}.json${cfg.key ? '?auth=' + cfg.key : ''}`;
+    if (cfg.type === 'supabase') return `${cfg.url}/rest/v1/${path}`;
+    return `${cfg.url}/${path}`;
+  },
+
+  async testConnection() {
+    try {
+      const cfg = this.cfg;
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 8000);
+      let r;
+      if (cfg.type === 'firebase') {
+        r = await fetch(this._url('bandmed_ping'), { signal: ctrl.signal });
+      } else if (cfg.type === 'supabase') {
+        r = await fetch(this._url('bandmed_store?limit=1'), { headers: this._head(), signal: ctrl.signal });
+        clearTimeout(tid);
+        // 401/403 = wrong key; anything else = connection ok (table may not exist yet)
+        return r.status !== 401 && r.status !== 403;
+      } else {
+        r = await fetch(this._url('bandmed_ping'), { headers: this._head(), signal: ctrl.signal });
+      }
+      clearTimeout(tid);
+      return r.status < 500;
+    } catch { return false; }
+  },
+
+  async checkUsersExist() {
+    try { const u = await this.loadUsers(); return u && u.length > 0; } catch { return false; }
+  },
+
+  async loadAll() {
+    const cfg = this.cfg;
+    try {
+      if (cfg.type === 'firebase') {
+        const r = await fetch(this._url('bandmed_data'));
+        if (!r.ok) return null;
+        return await r.json();
+      }
+      if (cfg.type === 'supabase') {
+        const r = await fetch(this._url('bandmed_store?store_key=eq.data'), { headers: this._head() });
+        if (!r.ok) return null;
+        const rows = await r.json();
+        return (Array.isArray(rows) && rows.length) ? rows[0].store_value : null;
+      }
+      const r = await fetch(this._url('bandmed_data'), { headers: this._head() });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  },
+
+  async saveAll(data) {
+    const cfg = this.cfg;
+    const payload = JSON.parse(JSON.stringify(data));
+    if (cfg.type === 'firebase') {
+      const r = await fetch(this._url('bandmed_data'), { method:'PUT', headers:this._head(), body:JSON.stringify(payload) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return true;
+    }
+    if (cfg.type === 'supabase') {
+      const r = await fetch(this._url('bandmed_store'), {
+        method:'POST',
+        headers: this._head({'Prefer':'resolution=merge-duplicates,return=minimal'}),
+        body: JSON.stringify({store_key:'data', store_value:payload})
+      });
+      if (!r.ok) throw new Error('Supabase HTTP ' + r.status);
+      return true;
+    }
+    const r = await fetch(this._url('bandmed_data'), { method:'PUT', headers:this._head(), body:JSON.stringify(payload) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return true;
+  },
+
+  async loadUsers() {
+    const cfg = this.cfg;
+    try {
+      if (cfg.type === 'firebase') {
+        const r = await fetch(this._url('bandmed_usuarios'));
+        if (!r.ok) return [];
+        const data = await r.json();
+        if (!data) return [];
+        return Array.isArray(data) ? data : Object.values(data).filter(Boolean);
+      }
+      if (cfg.type === 'supabase') {
+        const r = await fetch(this._url('bandmed_store?store_key=eq.usuarios'), { headers:this._head() });
+        if (!r.ok) return [];
+        const rows = await r.json();
+        const val = (Array.isArray(rows) && rows.length) ? rows[0].store_value : null;
+        return Array.isArray(val) ? val : [];
+      }
+      const r = await fetch(this._url('bandmed_usuarios'), { headers:this._head() });
+      if (!r.ok) return [];
+      const data = await r.json();
+      return Array.isArray(data) ? data : Object.values(data||{}).filter(Boolean);
+    } catch { return []; }
+  },
+
+  async saveUsers(users) {
+    const cfg = this.cfg;
+    if (cfg.type === 'firebase') {
+      const obj = {};
+      users.forEach(u => { obj['u' + u.id] = u; });
+      const r = await fetch(this._url('bandmed_usuarios'), { method:'PUT', headers:this._head(), body:JSON.stringify(obj) });
+      return r.ok;
+    }
+    if (cfg.type === 'supabase') {
+      const r = await fetch(this._url('bandmed_store'), {
+        method:'POST',
+        headers: this._head({'Prefer':'resolution=merge-duplicates,return=minimal'}),
+        body: JSON.stringify({store_key:'usuarios', store_value:users})
+      });
+      return r.ok;
+    }
+    const r = await fetch(this._url('bandmed_usuarios'), { method:'PUT', headers:this._head(), body:JSON.stringify(users) });
+    return r.ok;
+  },
+
+  async pushLog(log) {
+    const cfg = this.cfg;
+    try {
+      if (cfg.type === 'firebase') {
+        // Firebase POST cria entrada com ID único automático
+        const fbUrl = `${cfg.url}/bandmed_logs.json${cfg.key ? '?auth=' + cfg.key : ''}`;
+        await fetch(fbUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(log) });
+        return true;
+      }
+      if (cfg.type === 'supabase') {
+        const r = await fetch(this._url('bandmed_store'), {
+          method:'POST',
+          headers: this._head({'Prefer':'resolution=merge-duplicates,return=minimal'}),
+          body: JSON.stringify({store_key:'log_' + Date.now(), store_value:log})
+        });
+        return r.ok;
+      }
+      const r = await fetch(this._url('bandmed_logs'), { method:'POST', headers:this._head(), body:JSON.stringify(log) });
+      return r.ok;
+    } catch { return false; }
+  }
+};
+
+// ── Gerar senha admin aleatória ──
+function generateAdminPassword() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789@#!';
+  return Array.from({length:12}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
+}
+
+// ── Criar utilizador administrador na nuvem ──
+async function createCloudAdmin() {
+  const adminUsername = 'admin';
+  const adminPwd = generateAdminPassword();
+  const hashed = await hashPassword(adminPwd);
+  const adminUser = { id:1, username:adminUsername, senha:hashed, nome:'Administrador', funcao:'Administrador', ativo:true, criadoEm:new Date().toISOString() };
+  try {
+    await CloudDB.saveUsers([adminUser]);
+    db.data.usuarios = [adminUser];
+    try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:[adminUser]})); } catch(e) {}
+    showAdminCredentials(adminUsername, adminPwd);
+  } catch(e) {
+    toast('error','Erro ao criar administrador', e.message);
+    showScreen('login');
+  }
+}
+
+// ── Mostrar credenciais admin por 30 segundos ──
+function showAdminCredentials(username, password) {
+  let secs = 30;
+  const overlay = document.createElement('div');
+  overlay.id = 'admin-cred-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;';
+  const render = () => {
+    overlay.innerHTML = `
+      <div style="background:var(--card-bg);border-radius:16px;padding:32px;max-width:420px;width:100%;box-shadow:0 24px 48px rgba(0,0,0,0.5);border:2px solid var(--accent);text-align:center;">
+        <div style="font-size:36px;margin-bottom:10px;">🔑</div>
+        <div style="font-size:17px;font-weight:700;color:var(--text-primary);margin-bottom:4px;">Conta Administrador Criada!</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:20px;">Guarde estes dados agora — <strong style="color:#e74c3c;">não serão mostrados novamente</strong></div>
+        <div style="background:rgba(0,0,0,0.35);border-radius:12px;padding:18px;margin-bottom:18px;text-align:left;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border);">
+            <span style="font-size:12px;color:var(--text-muted);">Utilizador</span>
+            <span style="font-size:15px;font-weight:700;color:var(--accent);font-family:monospace;">${username}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:12px;color:var(--text-muted);">Senha</span>
+            <span style="font-size:15px;font-weight:700;color:#e74c3c;font-family:monospace;letter-spacing:2px;">${password}</span>
+          </div>
+        </div>
+        <div style="margin-bottom:18px;">
+          <div style="display:inline-flex;align-items:center;gap:8px;background:rgba(231,76,60,0.12);border:1px solid rgba(231,76,60,0.3);border-radius:20px;padding:7px 18px;">
+            <span style="font-size:20px;font-weight:800;color:#e74c3c;min-width:26px;text-align:center;">${secs}</span>
+            <span style="font-size:12px;color:var(--text-muted);">segundos restantes</span>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px;">Após o login, crie outros utilizadores na secção <strong>Utilizadores</strong>.</div>
+        <button class="btn btn-primary" style="width:100%;font-size:13px;" onclick="document.getElementById('admin-cred-overlay').remove();showScreen('login');">
+          ✓ Já guardei — Ir para Login
+        </button>
+      </div>`;
+  };
+  render();
+  document.body.appendChild(overlay);
+  const iv = setInterval(() => {
+    secs--;
+    if (secs <= 0) { clearInterval(iv); overlay.remove(); showScreen('login'); toast('info','Sessão pronta','Faça login com as credenciais de administrador.'); }
+    else render();
+  }, 1000);
+}
+
+async function testCloudConnectionUI() {
+  const cfg = getCloudCfg();
+  if (!cfg) { toast('error','Sem configuração de nuvem'); return; }
+  toast('info','A testar ligação ' + cloudDbTypeName(cfg.type) + '...');
+  const ok = await CloudDB.testConnection();
+  if (ok) toast('success','Nuvem acessível!','Ligação ' + cloudDbTypeName(cfg.type) + ' estabelecida com sucesso.');
+  else toast('error','Nuvem inacessível','Verifique a ligação à internet e as credenciais.');
+}
+
+async function saveCloudCfgFromUI(url, key) {
+  url = (url||'').trim().replace(/\/+$/, '');
+  key = (key||'').trim();
+  if (!url || !key) { toast('error','URL e chave são obrigatórios'); return; }
+  const type = detectCloudDbType(url);
+  const cfg = { url, key, type, connectedAt: new Date().toISOString() };
+  _cloudCfg = cfg;
+  const ok = await CloudDB.testConnection();
+  if (!ok) { toast('error','Ligação falhou','Verifique o URL e a chave.'); _cloudCfg = null; return; }
+  saveCloudCfg(cfg);
+  setDbMode('cloud');
+  toast('success','Nuvem configurada!', cloudDbTypeName(type) + ' activo.');
+  renderBaseDados();
+}
+
+// ── Assistente de configuração da nuvem (wizard) ──
+function showCloudSetupWizard() {
+  // Don't show if already configured or overlay exists
+  if (document.getElementById('cloud-setup-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'cloud-setup-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.87);z-index:9998;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;';
+  overlay.innerHTML = `
+    <div style="background:var(--card-bg);border-radius:16px;padding:28px;max-width:510px;width:100%;box-shadow:0 24px 48px rgba(0,0,0,0.45);border:1px solid var(--border);">
+      <div style="text-align:center;margin-bottom:22px;">
+        <div style="width:54px;height:54px;border-radius:50%;background:linear-gradient(135deg,#00b894,#0a2463);display:flex;align-items:center;justify-content:center;margin:0 auto 10px;font-size:24px;">☁️</div>
+        <div style="font-size:17px;font-weight:700;color:var(--text-primary);">Ligação à Internet Detectada</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px;">Configure a base de dados em nuvem para acesso multi-dispositivo.<br>Pode ignorar e usar armazenamento local.</div>
+      </div>
+      <div style="margin-bottom:14px;">
+        <label style="font-size:11px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:5px;">URL da Base de Dados <span style="color:#e74c3c;">*</span></label>
+        <input id="cld-url" class="field-input" placeholder="https://projecto.firebaseio.com  ou  https://xxx.supabase.co" style="width:100%;box-sizing:border-box;font-size:12px;" oninput="onCloudUrlInput(this.value)">
+        <div id="cld-type-hint" style="font-size:10px;color:var(--text-muted);margin-top:3px;">Compatível com Firebase RTDB, Supabase ou qualquer REST API</div>
+      </div>
+      <div style="margin-bottom:16px;">
+        <label style="font-size:11px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:5px;">Chave de Acesso / API Key <span style="color:#e74c3c;">*</span></label>
+        <div style="position:relative;">
+          <input id="cld-key" class="field-input" type="password" placeholder="Token ou chave de autenticação..." style="width:100%;box-sizing:border-box;padding-right:40px;font-size:12px;">
+          <button onclick="var i=document.getElementById('cld-key');i.type=i.type==='password'?'text':'password'" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:15px;">👁</button>
+        </div>
+      </div>
+      <div id="cld-sb-hint" style="display:none;padding:10px 12px;background:rgba(61,213,152,0.07);border:1px dashed rgba(61,213,152,0.3);border-radius:8px;font-size:11px;color:var(--text-muted);margin-bottom:14px;">
+        <strong style="color:#3DD598;">Supabase detectado.</strong> Execute este SQL no <em>SQL Editor</em> do Supabase antes de continuar:<br>
+        <code style="display:block;margin-top:6px;background:rgba(0,0,0,0.3);padding:8px 10px;border-radius:6px;font-size:10px;line-height:1.6;white-space:pre;">CREATE TABLE IF NOT EXISTS bandmed_store (
+  store_key text PRIMARY KEY,
+  store_value jsonb
+);
+ALTER TABLE bandmed_store ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "allow_all" ON bandmed_store
+  FOR ALL USING (true) WITH CHECK (true);</code>
+      </div>
+      <div id="cld-status" style="display:none;padding:9px 13px;border-radius:8px;font-size:12px;margin-bottom:14px;"></div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn btn-secondary" style="flex:1;font-size:12px;" onclick="skipCloudSetupWizard()">Ignorar — Usar Local</button>
+        <button id="cld-btn" class="btn btn-primary" style="flex:2;font-size:12px;" onclick="submitCloudSetup()">☁ Conectar e Guardar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
+function onCloudUrlInput(val) {
+  const type = detectCloudDbType(val.trim());
+  const hint = document.getElementById('cld-type-hint');
+  const sbHint = document.getElementById('cld-sb-hint');
+  if (!hint || !sbHint) return;
+  if (val.trim().length > 10) {
+    hint.textContent = '✓ Tipo detectado: ' + cloudDbTypeName(type);
+    hint.style.color = 'var(--accent)';
+    sbHint.style.display = type === 'supabase' ? 'block' : 'none';
+  } else {
+    hint.textContent = 'Compatível com Firebase RTDB, Supabase ou qualquer REST API';
+    hint.style.color = 'var(--text-muted)';
+    sbHint.style.display = 'none';
+  }
+}
+
+function setCloudStatus(type, msg) {
+  const el = document.getElementById('cld-status');
+  if (!el) return;
+  el.style.display = 'block';
+  const c = {error:'#e74c3c', info:'var(--info)', success:'var(--accent)', warning:'#FFA000'}[type]||'var(--info)';
+  el.style.background = c + '18';
+  el.style.border = '1px solid ' + c + '45';
+  el.style.color = c;
+  el.textContent = msg;
+}
+
+function skipCloudSetupWizard() {
+  document.getElementById('cloud-setup-overlay')?.remove();
+  // Mark as skipped so wizard doesn't appear on next startup this session
+  sessionStorage.setItem('hmm_cloud_wizard_skipped', '1');
+  if (db.data.usuarios.length === 0) { showScreen('setup'); setupFirstRun(); }
+  else showScreen('login');
+}
+
+async function submitCloudSetup() {
+  const url = (document.getElementById('cld-url')?.value || '').trim().replace(/\/+$/, '');
+  const key = (document.getElementById('cld-key')?.value || '').trim();
+  if (!url) { setCloudStatus('error','O URL da base de dados é obrigatório.'); return; }
+  if (!key) { setCloudStatus('error','A chave de acesso é obrigatória.'); return; }
+  const btn = document.getElementById('cld-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'A conectar...'; }
+  const type = detectCloudDbType(url);
+  const cfg = { url, key, type, connectedAt: new Date().toISOString() };
+  _cloudCfg = cfg; // temp before saving
+  setCloudStatus('info', 'A testar ligação ' + cloudDbTypeName(type) + '...');
+  const ok = await CloudDB.testConnection();
+  if (!ok) {
+    setCloudStatus('error','Não foi possível conectar. Verifique o URL e a chave de acesso.');
+    if (btn) { btn.disabled=false; btn.textContent='☁ Conectar e Guardar'; }
+    _cloudCfg = null;
+    return;
+  }
+  setCloudStatus('info','Ligação estabelecida! A verificar utilizadores...');
+  saveCloudCfg(cfg);
+  setDbMode('cloud');
+  const hasUsers = await CloudDB.checkUsersExist();
+  document.getElementById('cloud-setup-overlay')?.remove();
+  if (hasUsers) {
+    const cloudUsers = await CloudDB.loadUsers();
+    if (cloudUsers && cloudUsers.length) {
+      db.data.usuarios = cloudUsers;
+      try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:cloudUsers})); } catch(e) {}
+    }
+    toast('success', cloudDbTypeName(type) + ' conectado!', 'Utilizadores carregados. Faça login.');
+    showScreen('login');
+  } else {
+    toast('info','A criar conta de administrador...','Aguarde...');
+    await createCloudAdmin();
+  }
+}
+
+// ── Reconectar nuvem automaticamente ao iniciar ──
+async function cloudAutoReconnect(onDone) {
+  const cfg = getCloudCfg();
+  if (!cfg) { onDone && onDone(false); return; }
+  _cloudCfg = cfg;
+  try {
+    const cloudUsers = await CloudDB.loadUsers();
+    if (cloudUsers && cloudUsers.length) {
+      db.data.usuarios = cloudUsers;
+      try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:cloudUsers})); } catch(e) {}
+      toast('success', cloudDbTypeName(cfg.type) + ' reconectado', 'Sessão restabelecida automaticamente.');
+      onDone && onDone(true);
+      return;
+    }
+  } catch(e) { console.warn('[Cloud] Auto-reconnect falhou:', e); }
+  toast('warning','Nuvem inacessível','A usar dados locais em cache.');
+  onDone && onDone(false);
+}
+
+// ── Desligar da nuvem ──
+function disconnectCloud() {
+  clearCloudCfg();
+  setDbMode('localstorage');
+  toast('info','Desligado da nuvem','Modo local activado.');
+  renderBaseDados();
+}
 
 async function pickXlsxFolder() {
   if (!window.showDirectoryPicker) {
@@ -1051,6 +1901,22 @@ class Database {
   constructor() { this.data = this.load(); }
   load() {
     try {
+      const mode = getDbMode();
+      // Modo IndexedDB: carregar apenas utilizadores do localStorage (para login rápido).
+      // Os dados completos serão carregados assincronamente por loadAsync().
+      if (mode === 'indexeddb') {
+        const raw = localStorage.getItem(DB_KEY);
+        const base = JSON.parse(JSON.stringify(DEFAULT_DB));
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          // Manter apenas os utilizadores do localStorage para autenticação
+          if (parsed && parsed.usuarios && parsed.usuarios.length) {
+            base.usuarios = parsed.usuarios;
+          }
+        }
+        return base;
+      }
+      // Para outros modos, carregar dados completos do localStorage normalmente
       const raw = localStorage.getItem(DB_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
@@ -1060,12 +1926,107 @@ class Database {
       return JSON.parse(JSON.stringify(DEFAULT_DB));
     } catch { return JSON.parse(JSON.stringify(DEFAULT_DB)); }
   }
+  // Carregamento assíncrono para IDB e Firebase
+  async loadAsync() {
+    const mode = getDbMode();
+    try {
+      if (mode === 'indexeddb') {
+        const idbData = await loadFromIDB();
+        if (idbData) {
+          // Preservar utilizadores do localStorage (mais recentes / autenticados)
+          const lsUsers = (() => {
+            try {
+              const raw = localStorage.getItem(DB_KEY);
+              if (!raw) return [];
+              const p = JSON.parse(raw);
+              return (p && p.usuarios) ? p.usuarios : [];
+            } catch(e) { return []; }
+          })();
+          this.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...idbData };
+          if (lsUsers.length) this.data.usuarios = lsUsers;
+          console.log('[IDB] loadAsync: dados carregados do IndexedDB — ' +
+            Object.entries(this.data).map(([k,v]) => `${k}:${Array.isArray(v)?v.length:'-'}`).join(', '));
+          return true;
+        } else {
+          console.warn('[IDB] loadAsync: IndexedDB vazio. O modo IndexedDB está activo mas não há dados guardados.');
+          return false;
+        }
+      } else if (mode === 'firebase') {
+        const fbData = await loadFromFirebaseStore();
+        if (fbData) {
+          const users = this.data.usuarios;
+          this.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...fbData };
+          this.data.usuarios = users.length ? users : this.data.usuarios;
+          return true;
+        }
+      } else if (mode === 'cloud') {
+        const cfg = getCloudCfg();
+        if (cfg) {
+          _cloudCfg = cfg;
+          const cloudData = await CloudDB.loadAll();
+          if (cloudData) {
+            this.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...cloudData };
+          }
+          const cloudUsers = await CloudDB.loadUsers();
+          if (cloudUsers && cloudUsers.length) {
+            this.data.usuarios = cloudUsers;
+            try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:cloudUsers})); } catch(e) {}
+          }
+          return !!(cloudData || (cloudUsers && cloudUsers.length));
+        }
+      }
+    } catch(e) {
+      console.warn('[DB] loadAsync falhou:', e);
+    }
+    return false;
+  }
   save() {
-    // Always save users to localStorage for security
-    localStorage.setItem(DB_KEY, JSON.stringify(this.data));
-    // Also async-write to xlsx if in xlsx mode
-    if (getDbMode() === 'xlsx' && xlsxDirHandle) {
+    const mode = getDbMode();
+    const usersOnly = { usuarios: this.data.usuarios };
+
+    // --- Guardar sempre no backend activo primeiro ---
+    if (mode === 'xlsx' && xlsxDirHandle) {
       writeXlsxDb(this.data).catch(()=>{});
+    } else if (mode === 'indexeddb') {
+      // IDB é o backend principal — guardar dados completos lá
+      saveToIDB(this.data).catch(e => console.warn('[IDB] save falhou:', e));
+      // No localStorage guardar apenas utilizadores (para login rápido)
+      try { localStorage.setItem(DB_KEY, JSON.stringify(usersOnly)); } catch(e) {}
+      return; // IDB trata de tudo, não precisamos de mais nada
+    } else if (mode === 'firebase') {
+      saveToFirebaseStore(this.data).catch(e => console.warn('[Firebase] save falhou:', e));
+      try { localStorage.setItem(DB_KEY, JSON.stringify(usersOnly)); } catch(e) {}
+      return;
+    } else if (mode === 'cloud') {
+      const cfg = getCloudCfg();
+      if (cfg && _isOnline) {
+        // Online: guardar na nuvem
+        CloudDB.saveAll(this.data).catch(e => console.warn('[Cloud] saveAll falhou:', e));
+        CloudDB.saveUsers(this.data.usuarios).catch(e => console.warn('[Cloud] saveUsers falhou:', e));
+      }
+      // Sempre manter cache local completa para funcionar offline
+      try { localStorage.setItem(DB_KEY, JSON.stringify(this.data)); } catch(e) {
+        try { localStorage.setItem(DB_KEY, JSON.stringify(usersOnly)); } catch(e2) {}
+      }
+      return;
+    }
+
+    // --- Modo localStorage: tentar guardar dados completos ---
+    try {
+      localStorage.setItem(DB_KEY, JSON.stringify(this.data));
+    } catch(lsErr) {
+      // LocalStorage cheio — guardar apenas utilizadores para não perder o login
+      // NÃO mudar o modo automaticamente: o utilizador deve decidir na secção Base de Dados
+      console.warn('[DB] LocalStorage cheio. Dados completos não foram guardados.');
+      try { localStorage.setItem(DB_KEY, JSON.stringify(usersOnly)); } catch(e) {
+        console.error('[DB] Impossível guardar mesmo só utilizadores:', e);
+      }
+      // Aviso único por sessão para não spam
+      if (!this._lsFullWarned) {
+        this._lsFullWarned = true;
+        toast('warning', 'Armazenamento quase cheio',
+          'O LocalStorage está cheio e alguns dados podem não ter sido guardados. Vá a Base de Dados → IndexedDB para activar um armazenamento sem limites.');
+      }
     }
   }
   async loadFromXlsx() {
@@ -1108,9 +2069,15 @@ class Database {
   }
   getStock(produtoId) {
     const movs = this.getAll('movimentacoes').filter(m => Number(m.produto_id) === Number(produtoId));
-    const entradas = movs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
-    const saidas = movs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const entradas = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const saidas = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
     return { entradas, saidas, stock: entradas - saidas };
+  }
+  getLoteStock(loteId) {
+    const movs = this.getAll('movimentacoes').filter(m => Number(m.lote_id) === Number(loteId));
+    const entradas = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const saidas = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    return entradas - saidas;
   }
   getShelfCount(prateleiraId) {
     return this.getAll('produtos').filter(p=>Number(p.prateleira_id)===Number(prateleiraId)).length;
@@ -1159,6 +2126,10 @@ function addLog(action, module, recordId, details) {
   // Keep max 2000 logs (remove oldest)
   if (db.data.logs.length > 2000) db.data.logs = db.data.logs.slice(-2000);
   db.save();
+  // Sincronizar log com a nuvem em tempo real
+  if (getDbMode() === 'cloud' && getCloudCfg()) {
+    CloudDB.pushLog(log).catch(() => {});
+  }
 }
 
 function buildLogDescription(action, module, recordId, details) {
@@ -1187,14 +2158,27 @@ const chartInstances = {};
 // ===================== UTILITIES =====================
 function formatDate(d) {
   if (!d) return '—';
+  const s = String(d);
+  // Already in DD-MM-YYYY display format — return as-is
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s)) return s;
+  // YYYY-MM-DD (old format) — reformat to DD-MM-YYYY
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [y,m,day] = s.split('-');
+    return `${day}-${m}-${y}`;
+  }
+  // Fallback — try locale format
   try { return new Date(d).toLocaleDateString('pt-AO',{day:'2-digit',month:'2-digit',year:'numeric'}); }
-  catch { return d; }
+  catch { return s; }
 }
 function formatMoney(v) {
   if (!v && v !== 0) return '—';
   return Number(v).toLocaleString('pt-AO') + ' AOA';
 }
-function today() { return new Date().toISOString().split('T')[0]; }
+function today() { const d=new Date(); return `${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}-${d.getFullYear()}`; }
+// Convert date input value (YYYY-MM-DD) to storage format (DD-MM-YYYY)
+function dateInputToStorage(v) { if(!v) return today(); const p=v.split('-'); if(p.length===3&&p[0].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return v; }
+// Convert storage format (DD-MM-YYYY) to date input value (YYYY-MM-DD)
+function storageToDateInput(v) { if(!v) return new Date().toISOString().split('T')[0]; const p=v.split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return v; }
 function daysUntil(dateStr) {
   if (!dateStr) return Infinity;
   return Math.floor((new Date(dateStr) - new Date()) / 86400000);
@@ -1247,7 +2231,7 @@ function setLoading(btn, loading) {
 }
 
 // ===================== SPLASH =====================
-function startSplash() {
+function startSplash(onDone) {
   const messages = ['Inicializando sistema...','Verificando base de dados...','Carregando configurações...','Preparando interface...','Sistema pronto!'];
   const fill = document.getElementById('splash-fill');
   const label = document.getElementById('splash-label');
@@ -1270,7 +2254,8 @@ function startSplash() {
         document.getElementById('splash').style.opacity='0';
         document.getElementById('splash').style.transition='opacity 0.5s ease';
         setTimeout(() => {
-          // First run check
+          // First run check — override with callback if provided
+          if (onDone) { onDone(); return; }
           if (db.data.usuarios.length === 0) {
             showScreen('setup');
             setupFirstRun();
@@ -1288,6 +2273,18 @@ function showScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   const screen = document.getElementById(name);
   if (screen) screen.classList.add('active');
+  // Refresh network badge on every screen transition
+  if (typeof updateNetworkStatusUI === 'function') updateNetworkStatusUI();
+  // On login screen: show/hide cloud config prompt
+  if (name === 'login') {
+    setTimeout(() => {
+      const cloudPrompt = document.getElementById('login-cloud-prompt');
+      if (cloudPrompt) {
+        const show = navigator.onLine && !getCloudCfg() && !sessionStorage.getItem('hmm_cloud_wizard_skipped');
+        cloudPrompt.style.display = show ? 'flex' : 'none';
+      }
+    }, 50);
+  }
 }
 
 // ===================== FIRST RUN SETUP =====================
@@ -1339,6 +2336,16 @@ function setupLogin() {
 
     // Find user and compare hashed password
     const hashed = await hashPassword(pwd);
+    // Em modo cloud e online: re-sincronizar utilizadores da nuvem antes de verificar
+    if (getDbMode() === 'cloud' && getCloudCfg() && _isOnline) {
+      try {
+        const freshUsers = await CloudDB.loadUsers();
+        if (freshUsers && freshUsers.length) {
+          db.data.usuarios = freshUsers;
+          try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {}
+        }
+      } catch(e) { console.warn('[Cloud] sync users no login falhou:', e); }
+    }
     const found = db.data.usuarios.find(u => u.username === username && u.senha === hashed && u.ativo !== false);
     if (found) {
       currentUser = found;
@@ -1346,7 +2353,32 @@ function setupLogin() {
       setLoading(btn, false);
       document.getElementById('login').style.opacity='0';
       document.getElementById('login').style.transition='opacity 0.4s ease';
-      setTimeout(() => { showScreen('app'); initApp(); }, 400);
+      // Carregar dados async do backend activo ANTES de mostrar a app
+      const mode = getDbMode();
+      if (mode === 'indexeddb' || mode === 'firebase' || mode === 'cloud') {
+        // Mostrar ecrã de carregamento enquanto IDB/Firebase carrega
+        const loginEl = document.getElementById('login');
+        if (loginEl) { loginEl.style.opacity='0'; loginEl.style.transition='opacity 0.3s ease'; }
+        try {
+          const loaded = await db.loadAsync();
+          if (loaded && mode === 'indexeddb') console.log('[DB] IndexedDB carregado com sucesso');
+          if (loaded && mode === 'firebase') console.log('[DB] Firebase carregado com sucesso');
+        } catch(e) {
+          console.warn('[initApp] loadAsync falhou:', e);
+          toast('error', 'Erro ao carregar dados',
+            'Não foi possível carregar os dados do ' + (mode === 'indexeddb' ? 'IndexedDB' : 'Firebase') + '. Verifique as definições em Base de Dados.');
+        }
+      } else {
+        document.getElementById('login').style.opacity='0';
+        document.getElementById('login').style.transition='opacity 0.4s ease';
+      }
+      setTimeout(() => {
+        showScreen('app');
+        initApp();
+        const m = getDbMode();
+        if (m === 'indexeddb') toast('success', 'IndexedDB activo', 'Todos os dados carregados da base de dados local.');
+        if (m === 'firebase') toast('success', 'Firebase activo', 'Dados sincronizados da nuvem.');
+      }, 400);
     } else {
       setLoading(btn, false);
       errorBox.textContent = 'Utilizador ou senha incorrectos.';
@@ -1362,12 +2394,16 @@ const RESTRICTED_ROLES = ['Administrador', 'Técnico'];
 function isPrivileged() { return RESTRICTED_ROLES.includes(currentUser?.funcao); }
 
 function initApp() {
-  document.getElementById('header-user-name').textContent = currentUser.nome;
-  const _hur=document.getElementById('header-user-role'); if(_hur)_hur.textContent=currentUser.funcao;
-  document.getElementById('header-user-avatar').textContent = initials(currentUser.nome);
-  document.getElementById('sidebar-user-name').textContent = currentUser.nome;
-  document.getElementById('sidebar-user-role').textContent = currentUser.funcao;
-  document.getElementById('sidebar-user-avatar').textContent = initials(currentUser.nome);
+  // Atualizar elementos do header — com null check para compatibilidade mobile/desktop
+  const setEl = (id, val) => { const el = document.getElementById(id); if(el) el.textContent = val; };
+  setEl('header-user-name',   currentUser.nome);
+  setEl('header-user-role',   currentUser.funcao);
+  setEl('header-user-avatar', initials(currentUser.nome));
+  setEl('sidebar-user-name',  currentUser.nome);
+  setEl('sidebar-user-role',  currentUser.funcao);
+  setEl('sidebar-user-avatar',initials(currentUser.nome));
+  // Atualizar badge de rede no header ao entrar na app
+  updateNetworkStatusUI();
 
   // ── Visibility by role ──────────────────────────────────────────
   const priv = isPrivileged();
@@ -1406,24 +2442,33 @@ function initApp() {
 // ===================== SIDEBAR =====================
 function setupSidebar() {
   const sidebar = document.getElementById('sidebar');
-  const _stBtn=document.getElementById('sidebar-toggle'); if(_stBtn)_stBtn.addEventListener('click', () => {
-    sidebarCollapsed = !sidebarCollapsed;
-    sidebar.classList.toggle('collapsed', sidebarCollapsed);
-  });
-  document.getElementById('sidebar-user').addEventListener('click', () => {
-    confirm('Terminar Sessão','Deseja terminar a sessão actual?').then(ok => {
-      if (ok) {
-        addLog('logout', 'usuarios', currentUser?.id, null);
-        currentUser = null;
-        // Destroy all charts before leaving
-        Object.keys(chartInstances).forEach(k => destroyChart(k));
-        showScreen('login');
-        document.getElementById('login').style.opacity='1';
-        document.getElementById('login-form').reset();
-        document.getElementById('login-error').classList.remove('show');
-      }
+  // sidebar-toggle pode não existir na versão mobile (usa drawer)
+  const toggleBtn = document.getElementById('sidebar-toggle');
+  if (toggleBtn && sidebar) {
+    toggleBtn.addEventListener('click', () => {
+      sidebarCollapsed = !sidebarCollapsed;
+      sidebar.classList.toggle('collapsed', sidebarCollapsed);
     });
-  });
+  }
+  const sidebarUser = document.getElementById('sidebar-user');
+  if (sidebarUser) {
+    sidebarUser.addEventListener('click', () => {
+      confirm('Terminar Sessão','Deseja terminar a sessão actual?').then(ok => {
+        if (ok) {
+          addLog('logout', 'usuarios', currentUser?.id, null);
+          currentUser = null;
+          Object.keys(chartInstances).forEach(k => destroyChart(k));
+          showScreen('login');
+          const l = document.getElementById('login');
+          if(l) l.style.opacity='1';
+          const f = document.getElementById('login-form');
+          if(f) f.reset();
+          const e = document.getElementById('login-error');
+          if(e) e.classList.remove('show');
+        }
+      });
+    });
+  }
 }
 
 // ===================== NAVIGATION =====================
@@ -1462,7 +2507,8 @@ function navigateTo(page) {
     item.classList.toggle('active', item.dataset.page === page);
   });
   document.getElementById('header-page-title').textContent = PAGE_TITLES[page]||page;
-  const _hbc=document.getElementById('header-breadcrumb-current'); if(_hbc)_hbc.textContent=PAGE_TITLES[page]||page;
+  const breadcrumb = document.getElementById('header-breadcrumb-current');
+  if (breadcrumb) breadcrumb.textContent = PAGE_TITLES[page]||page;
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   const pageEl = document.getElementById('page-'+page);
   if (pageEl) pageEl.classList.add('active');
@@ -1533,8 +2579,8 @@ function renderDashboard() {
   const lotes = db.getAll('lotes');
   const movs = db.getAll('movimentacoes');
 
-  const totalEntradas = movs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
-  const totalSaidas = movs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+  const totalEntradas = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+  const totalSaidas = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
   const alerts = getAlerts();
 
   const topProd = produtos.map(p => {
@@ -1542,7 +2588,8 @@ function renderDashboard() {
     return {...p, stock};
   }).sort((a,b)=>b.stock-a.stock).slice(0,5);
 
-  const recentMovs = [...movs].sort((a,b)=>new Date(b.data)-new Date(a.data)).slice(0,7);
+  const _toISO = d => { if(!d) return ''; const p = String(d).split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return d; };
+  const recentMovs = [...movs].sort((a,b)=>_toISO(b.data).localeCompare(_toISO(a.data))).slice(0,7);
 
   document.getElementById('page-dashboard').innerHTML = `
     <div class="stats-grid">
@@ -1557,10 +2604,10 @@ function renderDashboard() {
 
     <!-- CHARTS ROW -->
     <div class="charts-row">
-      <div class="chart-card">
-        <div class="chart-title" style="flex-wrap:wrap;gap:8px;">
-          <span>${ICONS.bar_chart} Consumo de Medicamentos</span>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div class="chart-card" style="overflow:hidden;">
+        <div class="chart-title" style="flex-wrap:wrap;gap:6px;margin-bottom:8px;">
+          <span style="font-size:11px;font-weight:600;">${ICONS.bar_chart} Consumo de Medicamentos</span>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px;width:100%;">
             <div class="chart-period-btns">
               <button class="chart-period-btn ${dashChartPeriod==='day'?'active':''}" onclick="setDashPeriod('day')">Dia</button>
               <button class="chart-period-btn ${dashChartPeriod==='month'?'active':''}" onclick="setDashPeriod('month')">Mês</button>
@@ -1568,48 +2615,48 @@ function renderDashboard() {
             </div>
             ${dashChartPeriod==='day' ? `
               <input type="date" id="dash-day-picker" value="${dashChartDay}"
-                style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:12px;color:var(--text-primary);"
+                style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:11px;color:var(--text-primary);flex:1;min-width:0;"
                 oninput="dashChartDay=this.value;updateConsumoChart()">
             ` : dashChartPeriod==='month' ? `
               <select id="dash-month-picker"
-                style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:12px;color:var(--text-primary);"
+                style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font-size:11px;color:var(--text-primary);flex:1;min-width:0;"
                 onchange="dashChartMonth=parseInt(this.value);updateConsumoChart()">
-                ${['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'].map((m,i)=>`<option value="${i}" ${dashChartMonth===i?'selected':''}>${m}</option>`).join('')}
+                ${['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'].map((m,i)=>`<option value="${i}" ${dashChartMonth===i?'selected':''}>${m}</option>`).join('')}
               </select>
               <input type="number" id="dash-myear-picker" value="${dashChartMYear}" min="2000" max="2099"
-                style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:12px;color:var(--text-primary);width:72px;"
+                style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font-size:11px;color:var(--text-primary);width:62px;"
                 oninput="dashChartMYear=parseInt(this.value)||new Date().getFullYear();updateConsumoChart()">
             ` : ''}
           </div>
         </div>
-        <div class="chart-container">
-          <canvas id="chart-consumo"></canvas>
+        <div class="chart-container" style="height:200px;width:100%;max-width:100%;">
+          <canvas id="chart-consumo" style="max-width:100%;"></canvas>
         </div>
       </div>
-      <div class="chart-card">
-        <div class="chart-title">${ICONS.pie_chart} Distribuição por Grupo Farmacológico</div>
-        <div class="chart-container">
-          <canvas id="chart-grupos"></canvas>
+      <div class="chart-card" style="overflow:hidden;">
+        <div class="chart-title" style="font-size:11px;">${ICONS.pie_chart} Distribuição por Grupo Farmacológico</div>
+        <div class="chart-container" style="height:200px;width:100%;max-width:100%;">
+          <canvas id="chart-grupos" style="max-width:100%;"></canvas>
         </div>
       </div>
     </div>
     <div class="charts-row">
-      <div class="chart-card">
-        <div class="chart-title">${ICONS.pie_chart} Entradas vs Saídas</div>
-        <div class="chart-container">
-          <canvas id="chart-entradas-saidas"></canvas>
+      <div class="chart-card" style="overflow:hidden;">
+        <div class="chart-title" style="font-size:11px;">${ICONS.pie_chart} Entradas vs Saídas</div>
+        <div class="chart-container" style="height:200px;width:100%;max-width:100%;">
+          <canvas id="chart-entradas-saidas" style="max-width:100%;"></canvas>
         </div>
       </div>
-      <div class="chart-card">
-        <div class="chart-title">${ICONS.bar_chart} Top 5 Produtos por Stock</div>
-        <div class="chart-container">
-          <canvas id="chart-top-stock"></canvas>
+      <div class="chart-card" style="overflow:hidden;">
+        <div class="chart-title" style="font-size:11px;">${ICONS.bar_chart} Top 5 Produtos por Stock</div>
+        <div class="chart-container" style="height:200px;width:100%;max-width:100%;">
+          <canvas id="chart-top-stock" style="max-width:100%;"></canvas>
         </div>
       </div>
     </div>
 
     <!-- TABLES ROW -->
-    <div class="grid-2-1" style="gap:20px;margin-bottom:20px;">
+    <div class="grid-2-1" style="gap:16px;margin-bottom:20px;">
       <div>
         <div class="dash-section-title">${ICONS.activity} Últimas Movimentações</div>
         <div class="table-wrap">
@@ -1621,7 +2668,7 @@ function renderDashboard() {
                 const p = db.getById('produtos', m.produto_id);
                 return `<tr>
                   <td class="td-name">${p?p.nome:'—'}</td>
-                  <td><span class="badge ${m.tipo==='Entrada'?'badge-success':'badge-danger'}">${m.tipo}</span></td>
+                  <td><span class="badge ${(m.tipo||'').toUpperCase()==='ENTRADA'?'badge-success':'badge-danger'}">${m.tipo||'—'}</span></td>
                   <td class="font-bold">${m.quantidade}</td>
                   <td>${m.destino||'—'}</td>
                   <td>${formatDate(m.data)}</td>
@@ -1758,8 +2805,8 @@ function initDashboardCharts(movs, produtos) {
   destroyChart('chart-entradas-saidas');
   const ctx3 = document.getElementById('chart-entradas-saidas');
   if (ctx3) {
-    const totalE = movs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
-    const totalS = movs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const totalE = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const totalS = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
     const hasData = totalE > 0 || totalS > 0;
     chartInstances['chart-entradas-saidas'] = new Chart(ctx3, {
       type:'doughnut',
@@ -1820,18 +2867,19 @@ function buildPeriodData(movs, period) {
   if (period === 'day') {
     // Show 24 hourly bars for the selected day
     const selDate = dashChartDay || now.toISOString().split('T')[0];
-    const dayMovs = movs.filter(m => m.data === selDate);
+    const _toISO2 = d => { if(!d) return ''; const p = String(d).split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return d; };
+    const dayMovs = movs.filter(m => _toISO2(m.data) === selDate);
     // Group by hour
     for (let h = 0; h < 24; h++) {
       labels.push(String(h).padStart(2,'0') + 'h');
       // movimentacoes don't store hour, so spread evenly in a single "All day" bar at h=0
       // Show just one bar "Dia todo" if no hour info, else spread
-      entradas.push(h === 12 ? dayMovs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0) : 0);
-      saidas.push(h === 12 ? dayMovs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0) : 0);
+      entradas.push(h === 12 ? dayMovs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0) : 0);
+      saidas.push(h === 12 ? dayMovs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0) : 0);
     }
     // If no hour field, just show a clean single-day summary with one bar
-    const totalE = dayMovs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
-    const totalS = dayMovs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const totalE = dayMovs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+    const totalS = dayMovs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
     const [y,mo,d] = selDate.split('-');
     labels   = [selDate ? `${d}/${mo}/${y}` : 'Dia'];
     entradas = [totalE];
@@ -1842,22 +2890,24 @@ function buildPeriodData(movs, period) {
     const selMonth = (typeof dashChartMonth === 'number') ? dashChartMonth : now.getMonth();
     const selYear  = dashChartMYear || now.getFullYear();
     const daysInMonth = new Date(selYear, selMonth + 1, 0).getDate();
+    const _toISO3 = d => { if(!d) return ''; const p = String(d).split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return d; };
     for (let d = 1; d <= daysInMonth; d++) {
       const key = `${selYear}-${String(selMonth+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
       labels.push(String(d));
-      const dm = movs.filter(m => m.data === key);
-      entradas.push(dm.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
-      saidas.push(dm.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
+      const dm = movs.filter(m => _toISO3(m.data) === key);
+      entradas.push(dm.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
+      saidas.push(dm.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
     }
 
   } else {
     // Last 5 years
+    const _toISO4 = d => { if(!d) return ''; const p = String(d).split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return d; };
     for (let i=4; i>=0; i--) {
       const y = now.getFullYear()-i;
       labels.push(String(y));
-      const yMovs = movs.filter(mv=>new Date(mv.data).getFullYear()===y);
-      entradas.push(yMovs.filter(m=>m.tipo==='Entrada').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
-      saidas.push(yMovs.filter(m=>m.tipo==='Saída').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
+      const yMovs = movs.filter(mv=>new Date(_toISO4(mv.data)).getFullYear()===y);
+      entradas.push(yMovs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
+      saidas.push(yMovs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0));
     }
   }
   return { labels, entradas, saidas };
@@ -1888,7 +2938,6 @@ function renderProdutos() {
         <div class="table-title">${ICONS.list} Lista de Produtos <span class="chip">${produtos.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <span class="search-icon">${ICONS.search}</span>
             <input class="search-input" id="search-produtos" placeholder="Pesquisar produto..." value="${prodSearch}" oninput="prodSearch=this.value;filterProdutosTable()">
           </div>
         </div>
@@ -2087,7 +3136,6 @@ function renderFornecedores() {
         <div class="table-title">${ICONS.list} Lista de Fornecedores <span class="chip">${forns.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <span class="search-icon">${ICONS.search}</span>
             <input class="search-input" id="search-fornecedores" placeholder="Pesquisar..." value="${fornSearch}" oninput="fornSearch=this.value;filterFornecedoresTable()">
           </div>
         </div>
@@ -2390,10 +3438,9 @@ function renderLotes() {
         <div class="table-title">${ICONS.list} Lotes <span class="chip">${lotes.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <span class="search-icon">${ICONS.search}</span>
-            <input class="search-input" id="search-lotes" placeholder="Pesquisar lote..." value="${loteSearch}" oninput="loteSearch=this.value;filterLotesTable()">
+            <input class="search-input" id="search-lotes" placeholder="Pesquisar por lote ou produto..." value="${loteSearch}" oninput="loteSearch=this.value;renderLotesFiltered()">
           </div>
-          <select class="select-filter" onchange="loteFilter=this.value;filterLotesTable()">
+          <select class="select-filter" onchange="loteFilter=this.value;renderLotesFiltered()">
             <option value="todos" ${loteFilter==='todos'?'selected':''}>Todos</option>
             <option value="ativos" ${loteFilter==='ativos'?'selected':''}>Activos</option>
             <option value="avencer" ${loteFilter==='avencer'?'selected':''}>A Vencer</option>
@@ -2403,30 +3450,34 @@ function renderLotes() {
       </div>
       <div class="tbl-scroll">
       <table>
-        <thead><tr><th>Nº Lote</th><th>Produto</th><th>Fornecedor</th><th>Quantidade</th><th>Validade</th><th>Dias Rest.</th><th>Código Barras</th><th>Status</th><th>Acções</th></tr></thead>
+        <thead><tr><th>Nº Lote</th><th>Produto</th><th>Fornecedor</th><th>Qtd. Inicial</th><th>Stock Actual</th><th>Validade</th><th>Dias Rest.</th><th>Código Barras</th><th>Status</th><th>Acções</th></tr></thead>
         <tbody id="tbody-lotes">
           ${lotes.length ? lotes.map(l=>{
             const prod=db.getById('produtos',l.produto_id);
             const forn=db.getById('fornecedores',l.fornecedor_id);
             const st=getLotStatus(l.validade);
             const dias=daysUntil(l.validade);
-            return `<tr>
-              <td class="font-mono text-accent">${l.numero_lote}</td>
+            const stockActual = db.getLoteStock(l.id);
+            const isBloqueado = !!l.bloqueado;
+            return `<tr style="${isBloqueado?'opacity:0.65;background:var(--bg-tertiary,#f5f5f5);':''}">
+              <td class="font-mono text-accent">${l.numero_lote}${isBloqueado?` <span style="color:var(--danger,#dc3545);font-size:10px;">🔒</span>`:''}</td>
               <td class="td-name">${prod?prod.nome:'—'}</td>
               <td>${forn?forn.nome:'—'}</td>
               <td class="font-bold">${l.quantidade||0}</td>
+              <td class="font-bold ${stockActual<0?'text-danger':stockActual===0?'text-muted':'text-accent'}">${stockActual}</td>
               <td>${formatDate(l.validade)}</td>
               <td class="${dias<0?'text-danger':dias<=90?'text-warning':'text-accent'}">${dias<0?`Há ${Math.abs(dias)}d`:dias===Infinity?'—':`${dias}d`}</td>
               <td class="font-mono text-muted">${l.codigo_barra||'—'}</td>
               <td><span class="badge ${st.cls}">${st.label}</span></td>
               <td>
                 <div style="display:flex;gap:5px;">
+                  <button class="btn btn-secondary btn-icon" title="${isBloqueado?'Desbloquear lote':'Bloquear lote'}" onclick="toggleLoteBloqueado(${l.id})" style="${isBloqueado?'color:var(--warning,#ffc107);':''}">${isBloqueado?ICONS.unlock:ICONS.lock}</button>
                   <button class="btn btn-secondary btn-icon" onclick="openLoteModal(${l.id})">${ICONS.edit}</button>
                   <button class="btn btn-danger btn-icon" onclick="deleteLote(${l.id})">${ICONS.trash}</button>
                 </div>
               </td>
             </tr>`;
-          }).join('') : `<tr><td colspan="9"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado</p></div></td></tr>`}
+          }).join('') : `<tr><td colspan="10"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado</p></div></td></tr>`}
         </tbody>
       </table>
       </div>
@@ -2532,7 +3583,7 @@ async function saveLote() {
       const forn=db.getById('fornecedores',data.fornecedor_id);
       const novoLote=db.getById('lotes',editingId);
       db.insert('movimentacoes',{
-        produto_id:prodId, tipo:'Entrada',
+        produto_id:prodId, produto_nome: db.getById('produtos',prodId)?.nome||`Produto #${prodId}`, tipo:'ENTRADA',
         lote_id:editingId, quantidade:diff,
         destino:`Entrada automática — Adição ao Lote ${numero}${forn?' (Forn: '+forn.nome+')':''}`,
         data:today(), preco:null, auto:true,
@@ -2548,7 +3599,7 @@ async function saveLote() {
     if(qtd > 0){
       const forn=db.getById('fornecedores',data.fornecedor_id);
       db.insert('movimentacoes',{
-        produto_id:prodId, tipo:'Entrada',
+        produto_id:prodId, produto_nome: db.getById('produtos',prodId)?.nome||`Produto #${prodId}`, tipo:'ENTRADA',
         lote_id:novoLote.id, quantidade:qtd,
         destino:`Entrada automática — Novo Lote ${numero}${forn?' | Forn: '+forn.nome:''}`,
         data:today(), preco:null, auto:true,
@@ -2567,21 +3618,129 @@ async function deleteLote(id) {
   if(ok){db.remove('lotes',id);toast('success','Lote eliminado');renderLotes();updateAlertBadge();}
 }
 
+async function toggleLoteBloqueado(id) {
+  const l = db.getById('lotes', id);
+  if (!l) return;
+  const bloqueado = !l.bloqueado;
+  const acao = bloqueado ? 'bloquear' : 'desbloquear';
+  const ok = await confirm(
+    bloqueado ? 'Bloquear Lote' : 'Desbloquear Lote',
+    `Deseja ${acao} o lote "${l.numero_lote}"? ${bloqueado ? 'Nenhuma movimentação poderá ser feita com este lote enquanto estiver bloqueado.' : 'O lote voltará a estar disponível para movimentações.'}`
+  );
+  if (ok) {
+    db.update('lotes', id, { bloqueado });
+    toast(bloqueado ? 'warning' : 'success',
+      bloqueado ? 'Lote bloqueado' : 'Lote desbloqueado',
+      `O lote "${l.numero_lote}" foi ${bloqueado ? 'bloqueado' : 'desbloqueado'} com sucesso.`
+    );
+    renderLotes();
+  }
+}
+
 // ===================== MOVIMENTACOES PAGE =====================
 let movSearch='', movFilter='todos', movDateFrom='', movDateTo='';
+let movPage=0;             // página actual (0-indexed)
+const MOV_PAGE_SIZE=100;   // desktop: 100 linhas por página
 
 function renderMovimentacoes() {
-  const produtos = db.getAll('produtos');
-  const lotes = db.getAll('lotes');
+  movPage = 0;
+  _renderMovimentacoesUI();
+}
+
+function _getMovsFiltrados() {
+  const toISO = d => { if(!d) return ''; const p=String(d).split('-'); if(p.length===3&&p[2].length===4)return p[2]+'-'+p[1]+'-'+p[0]; return String(d); };
   let movs = db.getAll('movimentacoes');
+  if (movSearch) {
+    const q = movSearch.toLowerCase();
+    movs = movs.filter(m=>{
+      const nome=(m.produto_nome||(db.getById('produtos',m.produto_id)?.nome)||'').toLowerCase();
+      return nome.includes(q)||(m.destino||'').toLowerCase().includes(q);
+    });
+  }
+  if (movFilter!=='todos') movs = movs.filter(m=>(m.tipo||'').toUpperCase()===movFilter.toUpperCase());
+  if (movDateFrom) movs = movs.filter(m=>toISO(m.data)>=movDateFrom);
+  if (movDateTo)   movs = movs.filter(m=>toISO(m.data)<=movDateTo);
+  movs.sort((a,b)=>toISO(b.data).localeCompare(toISO(a.data)));
+  return movs;
+}
 
-  // Filters
-  if (movSearch) movs = movs.filter(m=>(db.getById('produtos',m.produto_id)?.nome||'').toLowerCase().includes(movSearch.toLowerCase())||(m.destino||'').toLowerCase().includes(movSearch.toLowerCase()));
-  if (movFilter!=='todos') movs = movs.filter(m=>m.tipo===movFilter);
-  if (movDateFrom) movs = movs.filter(m=>m.data >= movDateFrom);
-  if (movDateTo) movs = movs.filter(m=>m.data <= movDateTo);
+function _buildMovRow(m) {
+  const prodNome = m.produto_nome||(db.getById('produtos',m.produto_id)?.nome)||'—';
+  const lot = db.getById('lotes', m.lote_id);
+  const isEnt = (m.tipo||'').toUpperCase()==='ENTRADA';
+  return `<tr>
+    <td class="td-name">${prodNome}</td>
+    <td><span class="badge ${isEnt?'badge-success':'badge-danger'}">${isEnt?ICONS.arrow_up:ICONS.arrow_down} ${m.tipo||'—'}</span></td>
+    <td class="font-mono text-muted">${lot?lot.numero_lote:'—'}</td>
+    <td class="font-bold ${isEnt?'text-accent':'text-danger'}">${m.quantidade}</td>
+    <td>${m.destino||'—'}</td>
+    <td>${m.preco?formatMoney(m.preco):'—'}</td>
+    <td>${formatDate(m.data)}</td>
+    <td><div style="display:flex;gap:5px;">
+      <button class="btn btn-secondary btn-icon" onclick="openMovModal(${m.id})">${ICONS.edit}</button>
+      <button class="btn btn-danger btn-icon" onclick="deleteMov(${m.id})">${ICONS.trash}</button>
+    </div></td>
+  </tr>`;
+}
 
-  const sortedMovs = [...movs].sort((a,b)=>new Date(b.data)-new Date(a.data));
+function _renderMovPagination(total, page) {
+  const totalPages = Math.max(1, Math.ceil(total / MOV_PAGE_SIZE));
+  if (totalPages <= 1) return '';
+  const from = page * MOV_PAGE_SIZE + 1;
+  const to   = Math.min((page+1)*MOV_PAGE_SIZE, total);
+  const pages = [];
+  // Mostrar até 7 botões de página em desktop
+  let pStart = Math.max(0, page-3), pEnd = Math.min(totalPages-1, page+3);
+  if (pEnd - pStart < 6) { pStart = Math.max(0, pEnd-6); pEnd = Math.min(totalPages-1, pStart+6); }
+  for (let i=pStart; i<=pEnd; i++) {
+    pages.push(`<button class="btn ${i===page?'btn-primary':'btn-secondary'} mov-pag-num" onclick="movGoPage(${i})">${i+1}</button>`);
+  }
+  return `<div class="mov-pagination">
+    <button class="btn btn-secondary" onclick="movGoPage(0)" ${page===0?'disabled':''} title="Primeira">«</button>
+    <button class="btn btn-secondary" onclick="movGoPage(${page-1})" ${page===0?'disabled':''}>‹</button>
+    ${pages.join('')}
+    <button class="btn btn-secondary" onclick="movGoPage(${page+1})" ${page>=totalPages-1?'disabled':''}>›</button>
+    <button class="btn btn-secondary" onclick="movGoPage(${totalPages-1})" ${page>=totalPages-1?'disabled':''} title="Última">»</button>
+    <span class="mov-pag-info">${from}–${to} de ${total} registos</span>
+  </div>`;
+}
+
+function movGoPage(p) {
+  const total = _getMovsFiltrados().length;
+  const totalPages = Math.max(1, Math.ceil(total / MOV_PAGE_SIZE));
+  movPage = Math.max(0, Math.min(p, totalPages-1));
+  _updateMovTbody();
+  // scroll suave para o topo da tabela em desktop
+  const wrap = document.getElementById('page-movimentacoes');
+  if (wrap) wrap.scrollTo({top:0, behavior:'smooth'});
+}
+
+function _updateMovTbody() {
+  const allMovs   = _getMovsFiltrados();
+  const total     = allMovs.length;
+  const totalPages= Math.max(1, Math.ceil(total / MOV_PAGE_SIZE));
+  if (movPage >= totalPages) movPage = totalPages-1;
+  const page = allMovs.slice(movPage*MOV_PAGE_SIZE, (movPage+1)*MOV_PAGE_SIZE);
+
+  const tbody = document.getElementById('tbody-movimentacoes');
+  if (tbody) tbody.innerHTML = page.length
+    ? page.map(_buildMovRow).join('')
+    : `<tr><td colspan="8"><div class="table-empty">${ICONS.movement}<p>Nenhuma movimentação encontrada</p></div></td></tr>`;
+
+  const counter = document.querySelector('#page-movimentacoes .table-title .chip');
+  if (counter) counter.textContent = total;
+
+  ['mov-pagination-bar','mov-pagination-bar-bottom'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.innerHTML=_renderMovPagination(total, movPage);
+  });
+}
+
+function _renderMovimentacoesUI() {
+  const produtos = db.getAll('produtos');
+  const allMovs  = _getMovsFiltrados();
+  const total    = allMovs.length;
+  const page     = allMovs.slice(movPage*MOV_PAGE_SIZE, (movPage+1)*MOV_PAGE_SIZE);
 
   document.getElementById('page-movimentacoes').innerHTML = `
     <div class="page-header">
@@ -2595,54 +3754,37 @@ function renderMovimentacoes() {
     </div>
     <div class="table-wrap">
       <div class="table-header">
-        <div class="table-title">${ICONS.list} Movimentações <span class="chip">${sortedMovs.length}</span></div>
+        <div class="table-title">${ICONS.list} Movimentações <span class="chip">${total}</span></div>
         <div class="table-actions" style="flex-wrap:wrap;gap:8px;">
           <div class="search-wrap">
-            <span class="search-icon">${ICONS.search}</span>
-            <input class="search-input" id="search-movimentacoes" placeholder="Pesquisar produto/destino..." value="${movSearch}" oninput="movSearch=this.value;filterMovimentacoesTable()">
+            <input class="search-input" id="search-movimentacoes" placeholder="Pesquisar produto/destino..." value="${movSearch}" oninput="movSearch=this.value;movPage=0;filterMovimentacoesTable()">
           </div>
-          <select class="select-filter" onchange="movFilter=this.value;filterMovimentacoesTable()">
+          <select class="select-filter" onchange="movFilter=this.value;movPage=0;filterMovimentacoesTable()">
             <option value="todos" ${movFilter==='todos'?'selected':''}>Todos os tipos</option>
-            <option value="Entrada" ${movFilter==='Entrada'?'selected':''}>Entradas</option>
-            <option value="Saída" ${movFilter==='Saída'?'selected':''}>Saídas</option>
+            <option value="ENTRADA" ${movFilter==='ENTRADA'?'selected':''}>Entradas</option>
+            <option value="SAÍDA" ${movFilter==='SAÍDA'?'selected':''}>Saídas</option>
           </select>
           <div class="date-filter-wrap">
             ${ICONS.calendar}
-            <input type="date" value="${movDateFrom}" onchange="movDateFrom=this.value;filterMovimentacoesTable()" title="Data de início">
+            <input type="date" value="${movDateFrom}" onchange="movDateFrom=this.value;movPage=0;filterMovimentacoesTable()" title="Data de início">
             <span>—</span>
-            <input type="date" value="${movDateTo}" onchange="movDateTo=this.value;filterMovimentacoesTable()" title="Data de fim">
+            <input type="date" value="${movDateTo}" onchange="movDateTo=this.value;movPage=0;filterMovimentacoesTable()" title="Data de fim">
           </div>
-          ${(movDateFrom||movDateTo) ? `<button class="btn btn-secondary" onclick="movDateFrom='';movDateTo='';filterMovimentacoesTable()" style="padding:6px 10px;font-size:11px;">${ICONS.x} Limpar datas</button>` : ''}
+          ${(movDateFrom||movDateTo)?`<button class="btn btn-secondary" onclick="movDateFrom='';movDateTo='';movPage=0;filterMovimentacoesTable()" style="padding:6px 10px;font-size:11px;">${ICONS.x} Limpar datas</button>`:''}
         </div>
       </div>
+      <div id="mov-pagination-bar">${_renderMovPagination(total, movPage)}</div>
       <div class="tbl-scroll">
       <table>
         <thead><tr>
           <th>Produto</th><th>Tipo</th><th>Lote</th><th>Quantidade</th><th>Destino/Origem</th><th>Preço Unit.</th><th>Data</th><th>Acções</th>
         </tr></thead>
         <tbody id="tbody-movimentacoes">
-          ${sortedMovs.length ? sortedMovs.map(m=>{
-            const prod=db.getById('produtos',m.produto_id);
-            const lot=db.getById('lotes',m.lote_id);
-            return `<tr>
-              <td class="td-name">${prod?prod.nome:'—'}</td>
-              <td><span class="badge ${m.tipo==='Entrada'?'badge-success':'badge-danger'}">${m.tipo==='Entrada'?ICONS.arrow_up:ICONS.arrow_down} ${m.tipo}</span></td>
-              <td class="font-mono text-muted">${lot?lot.numero_lote:'—'}</td>
-              <td class="font-bold ${m.tipo==='Entrada'?'text-accent':'text-danger'}">${m.quantidade}</td>
-              <td>${m.destino||'—'}</td>
-              <td>${m.preco?formatMoney(m.preco):'—'}</td>
-              <td>${formatDate(m.data)}</td>
-              <td>
-                <div style="display:flex;gap:5px;">
-                  <button class="btn btn-secondary btn-icon" onclick="openMovModal(${m.id})">${ICONS.edit}</button>
-                  <button class="btn btn-danger btn-icon" onclick="deleteMov(${m.id})">${ICONS.trash}</button>
-                </div>
-              </td>
-            </tr>`;
-          }).join('') : `<tr><td colspan="8"><div class="table-empty">${ICONS.movement}<p>Nenhuma movimentação encontrada</p></div></td></tr>`}
+          ${page.length ? page.map(_buildMovRow).join('') : `<tr><td colspan="8"><div class="table-empty">${ICONS.movement}<p>Nenhuma movimentação encontrada</p></div></td></tr>`}
         </tbody>
       </table>
       </div>
+      <div id="mov-pagination-bar-bottom">${_renderMovPagination(total, movPage)}</div>
     </div>
 
     <div class="modal-overlay" id="modal-mov">
@@ -2690,7 +3832,7 @@ function renderMovimentacoes() {
             </div>
             <div class="field-wrap">
               <label class="field-label">${ICONS.calendar} Data</label>
-              <input class="field-input" id="mov-data" type="date" value="${today()}">
+              <input class="field-input" id="mov-data" type="date" value="${new Date().toISOString().split('T')[0]}">
             </div>
             <div class="field-wrap form-grid-full">
               <label class="field-label">${ICONS.money} Preço Unitário (AOA)</label>
@@ -2723,8 +3865,33 @@ function updateMovLotes() {
 }
 
 function openMovModal(id=null) {
+  // Garantir que a combobox está fechada e no lugar certo antes de abrir
+  closeMovCombo();
+
   editingId=id;
   document.getElementById('modal-mov-title').textContent=id?'Editar Movimentação':'Nova Movimentação';
+
+  // Repopular a lista da combobox com produtos actualizados
+  const wrap = document.getElementById('combo-mov-produto-wrap');
+  let list = document.getElementById('combo-mov-produto-list');
+  if (list && wrap) {
+    // Garantir que está no wrap (não no body)
+    if (list.parentElement !== wrap) wrap.appendChild(list);
+    // Repopular
+    const produtos = db.getAll('produtos');
+    list.innerHTML = produtos.map(p => {
+      const {stock} = db.getStock(p.id);
+      const stockClass = stock<=0?'combo-stock-zero':stock<=(p.stock_minimo||0)?'combo-stock-low':'combo-stock-ok';
+      return `<div class="combo-option" data-id="${p.id}" data-nome="${p.nome.replace(/"/g,'&quot;')}" onmousedown="selectMovCombo(${p.id},this.dataset.nome)"><span class="combo-opt-nome">${p.nome}</span><span class="combo-opt-stock ${stockClass}">${stock} un.</span></div>`;
+    }).join('');
+    list.style.display = 'none';
+    list.style.position = '';
+    list.style.top = '';
+    list.style.left = '';
+    list.style.width = '';
+    list.style.zIndex = '';
+  }
+
   if(id){
     const m=db.getById('movimentacoes',id);
     if(m){
@@ -2732,11 +3899,11 @@ function openMovModal(id=null) {
       document.getElementById('mov-produto').value=m.produto_id||'';
       document.getElementById('combo-mov-produto-input').value = prod ? prod.nome : '';
       updateMovLotes();
-      document.getElementById('mov-tipo').value=m.tipo||'Entrada';
+      document.getElementById('mov-tipo').value=(m.tipo||'ENTRADA').toUpperCase()==='ENTRADA'?'Entrada':'Saída';
       document.getElementById('mov-lote').value=m.lote_id||'';
       document.getElementById('mov-quantidade').value=m.quantidade||'';
       document.getElementById('mov-destino').value=m.destino||'';
-      document.getElementById('mov-data').value=m.data||today();
+      document.getElementById('mov-data').value=storageToDateInput(m.data)||new Date().toISOString().split('T')[0];
       document.getElementById('mov-preco').value=m.preco||'';
     }
   } else {
@@ -2746,7 +3913,7 @@ function openMovModal(id=null) {
     document.getElementById('mov-lote').value='';
     document.getElementById('mov-quantidade').value='';
     document.getElementById('mov-destino').value='';
-    document.getElementById('mov-data').value=today();
+    document.getElementById('mov-data').value=new Date().toISOString().split('T')[0];
     document.getElementById('mov-preco').value='';
   }
   document.getElementById('modal-mov').classList.add('open');
@@ -2758,7 +3925,16 @@ async function saveMov() {
   const qtd=parseInt(document.getElementById('mov-quantidade').value);
   if(!prodId){toast('error','Produto obrigatório');return;}
   if(!qtd||qtd<1){toast('error','Quantidade inválida');return;}
-  if(tipo==='Saída'){
+  // Verificar se o lote está bloqueado
+  const loteIdSel = parseInt(document.getElementById('mov-lote').value)||null;
+  if (loteIdSel) {
+    const loteSel = db.getById('lotes', loteIdSel);
+    if (loteSel && loteSel.bloqueado) {
+      toast('error', 'Lote bloqueado', `O lote "${loteSel.numero_lote}" está bloqueado e não pode ser movimentado. Desbloqueie-o primeiro na secção de Lotes.`);
+      return;
+    }
+  }
+  if(tipo.toUpperCase()==='SAÍDA'){
     const {stock}=db.getStock(prodId);
     const prod=db.getById('produtos',prodId);
     if(stock-qtd<0){toast('error','Stock insuficiente',`Stock actual: ${stock}. Saída bloqueada.`);return;}
@@ -2766,12 +3942,15 @@ async function saveMov() {
   const btn=document.getElementById('btn-save-mov');
   setLoading(btn,true);
   await new Promise(r=>setTimeout(r,400));
+  const prodObj = db.getById('produtos', prodId);
   const data={
-    produto_id:prodId, tipo,
+    produto_id:prodId,
+    produto_nome: prodObj ? prodObj.nome : `Produto #${prodId}`,
+    tipo: tipo.toUpperCase(),
     lote_id:parseInt(document.getElementById('mov-lote').value)||null,
     quantidade:qtd,
     destino:document.getElementById('mov-destino').value,
-    data:document.getElementById('mov-data').value||today(),
+    data: dateInputToStorage(document.getElementById('mov-data').value),
     preco:parseFloat(document.getElementById('mov-preco').value)||null,
     usuario_nome: currentUser?.nome || '',
     usuario_id: currentUser?.id || null,
@@ -2893,10 +4072,11 @@ function exportReportXLSX(key) {
         })}];
         filename = `relatorio_lotes_${today()}.xlsx`;
       } else if (key === 'movimentacoes') {
+        const _ri = d => { if(!d) return ''; const p = String(d).split('-'); if(p.length===3&&p[2].length===4) return `${p[2]}-${p[1]}-${p[0]}`; return d; };
         const rows = db.getAll('movimentacoes').map(m=>{
-          const p=db.getById('produtos',m.produto_id), l=db.getById('lotes',m.lote_id);
-          return {'ID':m.id,'Produto':p?p.nome:'','Tipo':m.tipo,'Lote':l?l.numero_lote:'','Quantidade':m.quantidade,'Destino Origem':m.destino||'','Preco Unit AOA':m.preco||0,'Data':m.data};
-        }).sort((a,b)=>new Date(b.Data)-new Date(a.Data));
+          const p=m.produto_nome||(db.getById('produtos',m.produto_id)?.nome)||'', l=db.getById('lotes',m.lote_id);
+          return {'ID':m.id,'Produto':p,'Tipo':m.tipo,'Lote':l?l.numero_lote:'','Quantidade':m.quantidade,'Destino Origem':m.destino||'','Preco Unit AOA':m.preco||0,'Data':m.data};
+        }).sort((a,b)=>_ri(b.Data).localeCompare(_ri(a.Data)));
         sheets = [{ name: 'Movimentacoes', data: rows }];
         filename = `relatorio_movimentacoes_${today()}.xlsx`;
       } else if (key === 'stock') {
@@ -2916,8 +4096,8 @@ function exportReportXLSX(key) {
           return {'Nome':p.nome,'Forma':p.forma||'','Grupo':p.grupo_farmacologico||'','Prateleira':prat?prat.nome:'','Stock Min':p.stock_minimo||0,'Entradas':entradas,'Saidas':saidas,'Stock Actual':stock};
         });
         const movRows = db.getAll('movimentacoes').map(m=>{
-          const p=db.getById('produtos',m.produto_id), l=db.getById('lotes',m.lote_id);
-          return {'Produto':p?p.nome:'','Tipo':m.tipo,'Lote':l?l.numero_lote:'','Qtd':m.quantidade,'Destino':m.destino||'','Data':m.data};
+          const p=m.produto_nome||(db.getById('produtos',m.produto_id)?.nome)||'', l=db.getById('lotes',m.lote_id);
+          return {'Produto':p,'Tipo':m.tipo,'Lote':l?l.numero_lote:'','Qtd':m.quantidade,'Destino':m.destino||'','Data':m.data};
         });
         const loteRows = db.getAll('lotes').map(l=>{
           const p=db.getById('produtos',l.produto_id), st=getLotStatus(l.validade);
@@ -2967,25 +4147,117 @@ function renderBaseDados() {
     <!-- STORAGE MODE -->
     <div class="card" style="margin-bottom:18px;">
       <div class="card-header"><div class="card-title">${ICONS.settings} Modo de Armazenamento</div></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:4px;">
-        <div class="db-mode-option ${mode==='localstorage'?'active':''}" onclick="switchDbMode('localstorage')" style="cursor:pointer;">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-            <div style="width:34px;height:34px;border-radius:8px;background:rgba(52,152,219,0.15);display:flex;align-items:center;justify-content:center;color:var(--info);">${ICONS.shield}</div>
-            <div style="flex:1"><div style="font-weight:700;font-size:13px;">LocalStorage</div><div style="font-size:10px;color:var(--text-muted)">Browser interno</div></div>
-            ${mode==='localstorage'?`<span class="badge badge-success">Activo</span>`:''}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px;">
+        <div class="db-mode-option ${mode==='localstorage'?'active':''}" onclick="switchDbMode('localstorage')" style="cursor:pointer;flex-direction:column;gap:8px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:34px;height:34px;border-radius:8px;background:rgba(52,152,219,0.15);display:flex;align-items:center;justify-content:center;color:var(--info);flex-shrink:0;">${ICONS.shield}</div>
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div style="font-weight:700;font-size:12px;">LocalStorage</div>
+                ${mode==='localstorage'?`<span class="badge badge-success" style="font-size:9px;">Activo</span>`:''}
+              </div>
+              <div style="font-size:10px;color:var(--text-muted);">Browser interno</div>
+            </div>
           </div>
-          <div style="font-size:11px;color:var(--text-secondary);">Rápido, offline, disponível no browser actual.</div>
+          <div style="font-size:11px;color:var(--text-secondary);padding:6px 8px;background:rgba(52,152,219,0.05);border-radius:6px;">Rápido, offline. Limite ~5MB (~500 movimentações).</div>
         </div>
-        <div class="db-mode-option ${mode==='xlsx'?'active':''}" onclick="switchDbMode('xlsx')" style="cursor:pointer;">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-            <div style="width:34px;height:34px;border-radius:8px;background:rgba(0,184,148,0.15);display:flex;align-items:center;justify-content:center;color:var(--accent);">${ICONS.download}</div>
-            <div style="flex:1"><div style="font-weight:700;font-size:13px;">Ficheiro .XLSX</div><div style="font-size:10px;color:var(--text-muted)">Excel externo</div></div>
-            ${mode==='xlsx'?`<span class="badge badge-success">Activo</span>`:''}
+        <div class="db-mode-option ${mode==='xlsx'?'active':''}" onclick="switchDbMode('xlsx')" style="cursor:pointer;flex-direction:column;gap:8px;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:34px;height:34px;border-radius:8px;background:rgba(0,184,148,0.15);display:flex;align-items:center;justify-content:center;color:var(--accent);flex-shrink:0;">${ICONS.download}</div>
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div style="font-weight:700;font-size:12px;">Ficheiro .XLSX</div>
+                ${mode==='xlsx'?`<span class="badge badge-success" style="font-size:9px;">Activo</span>`:''}
+              </div>
+              <div style="font-size:10px;color:var(--text-muted);">Excel externo</div>
+            </div>
           </div>
-          <div style="font-size:11px;color:var(--text-secondary);">Portável, editável externamente no Excel.</div>
-          ${mode==='xlsx'&&!xlsxDirHandle?`<button class="btn btn-warning" style="margin-top:6px;font-size:11px;padding:5px 8px;width:100%;" onclick="doReconnectXlsx(event)">Reconectar Pasta</button>`:''}
+          <div style="font-size:11px;color:var(--text-secondary);padding:6px 8px;background:rgba(0,184,148,0.05);border-radius:6px;">Portável, editável no Excel. Limite do sistema de ficheiros.</div>
+          ${mode==='xlsx'&&!xlsxDirHandle?`<button class="btn btn-warning" style="margin-top:4px;font-size:11px;padding:5px 8px;width:100%;" onclick="doReconnectXlsx(event)">Reconectar Pasta</button>`:''}
+        </div>
+        <div class="db-mode-option ${mode==='indexeddb'?'active':''}" onclick="switchDbMode('indexeddb')" style="cursor:pointer;flex-direction:column;gap:8px;border:${mode==='indexeddb'?'2px solid var(--accent)':'1px solid rgba(155,89,182,0.3)'};">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:34px;height:34px;border-radius:8px;background:rgba(155,89,182,0.15);display:flex;align-items:center;justify-content:center;color:#9B59B6;flex-shrink:0;">${ICONS.database}</div>
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div style="font-weight:700;font-size:12px;">SQLite / IndexedDB</div>
+                ${mode==='indexeddb'?`<span class="badge badge-success" style="font-size:9px;">Activo</span>`:`<span style="font-size:9px;background:rgba(155,89,182,0.2);color:#9B59B6;padding:2px 6px;border-radius:10px;font-weight:600;">RECOMENDADO</span>`}
+              </div>
+              <div style="font-size:10px;color:var(--text-muted);">Browser nativo</div>
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-secondary);padding:6px 8px;background:rgba(155,89,182,0.05);border-radius:6px;">⚡ Sem limites — suporta 12.000+ movimentações. Offline, rápido, persistente.</div>
+        </div>
+        <div class="db-mode-option ${mode==='firebase'?'active':''}" onclick="switchDbMode('firebase')" style="cursor:pointer;flex-direction:column;gap:8px;border:${mode==='firebase'?'2px solid var(--accent)':'1px solid rgba(255,160,0,0.3)'};">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:34px;height:34px;border-radius:8px;background:rgba(255,160,0,0.15);display:flex;align-items:center;justify-content:center;color:#FFA000;flex-shrink:0;">${ICONS.alert}</div>
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div style="font-weight:700;font-size:12px;">Firebase RTDB</div>
+                ${mode==='firebase'?`<span class="badge badge-success" style="font-size:9px;">Activo</span>`:`<span style="font-size:9px;background:rgba(255,160,0,0.2);color:#FFA000;padding:2px 6px;border-radius:10px;font-weight:600;">CLOUD</span>`}
+              </div>
+              <div style="font-size:10px;color:var(--text-muted);">Google Firebase</div>
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-secondary);padding:6px 8px;background:rgba(255,160,0,0.05);border-radius:6px;">☁️ Firebase Realtime Database — Google Cloud.</div>
+        </div>
+        <div class="db-mode-option ${mode==='cloud'?'active':''}" onclick="switchDbMode('cloud')" style="cursor:pointer;flex-direction:column;gap:8px;border:${mode==='cloud'?'2px solid #3DD598':'1px solid rgba(61,213,152,0.3)'};grid-column:1/-1;">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:34px;height:34px;border-radius:8px;background:rgba(61,213,152,0.15);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;">☁️</div>
+            <div style="flex:1;">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <div style="font-weight:700;font-size:12px;">Nuvem Universal</div>
+                ${mode==='cloud'?`<span class="badge badge-success" style="font-size:9px;">Activo</span>`:`<span style="font-size:9px;background:rgba(61,213,152,0.2);color:#3DD598;padding:2px 6px;border-radius:10px;font-weight:600;">RECOMENDADO</span>`}
+                ${mode==='cloud'&&getCloudCfg()?`<span style="font-size:9px;color:var(--text-muted);">${cloudDbTypeName(getCloudCfg().type)}</span>`:''}
+              </div>
+              <div style="font-size:10px;color:var(--text-muted);">Firebase · Supabase · REST API</div>
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-secondary);padding:6px 8px;background:rgba(61,213,152,0.05);border-radius:6px;">🌐 Login via nuvem · Dados sincronizados entre dispositivos · Utilizadores geridos pelo administrador · Logs em tempo real.</div>
+          ${mode==='cloud'&&getCloudCfg()?`<div style="display:flex;gap:8px;margin-top:2px;"><button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="testCloudConnectionUI()">Testar Ligação</button><button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;color:#e74c3c;" onclick="disconnectCloud()">Desligar</button></div>`:''}
         </div>
       </div>
+      ${(mode==='firebase'||localStorage.getItem('hmm_show_firebase_config'))?`
+      <div id="firebase-store-config" style="margin-top:14px;padding:14px;background:rgba(255,160,0,0.06);border:1px solid rgba(255,160,0,0.2);border-radius:10px;">
+        <div style="font-weight:700;font-size:12px;color:#FFA000;margin-bottom:10px;">${ICONS.settings} Configuração Firebase Realtime Database</div>
+        <div class="field-wrap" style="margin-bottom:8px;">
+          <label class="field-label" style="font-size:11px;">URL da Base de Dados <span class="field-req">*</span></label>
+          <input class="field-input" id="fb-store-url" placeholder="https://seu-projecto-default-rtdb.firebaseio.com" value="${getFirebaseStoreCfg()?.url||''}" style="font-size:12px;">
+        </div>
+        <div class="field-wrap" style="margin-bottom:10px;">
+          <label class="field-label" style="font-size:11px;">Chave de Autenticação (opcional)</label>
+          <input class="field-input" id="fb-store-key" type="password" placeholder="Token de acesso..." value="${getFirebaseStoreCfg()?.key||''}" style="font-size:12px;">
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary" style="flex:1;font-size:12px;" onclick="saveFirebaseStoreCfgUI()">Guardar Configuração</button>
+          <button class="btn btn-secondary" style="font-size:12px;" onclick="testFirebaseStoreUI()">Testar Ligação</button>
+        </div>
+      </div>`:''}
+      ${mode==='indexeddb'?`
+      <div style="margin-top:10px;padding:10px 14px;background:rgba(155,89,182,0.07);border:1px solid rgba(155,89,182,0.2);border-radius:8px;font-size:11px;color:var(--text-secondary);">
+        ${ICONS.info} <strong>IndexedDB activo.</strong> Os dados são guardados localmente sem limite de tamanho. Para migrar os dados para outro dispositivo, use <strong>Exportar → .JSON</strong>.
+      </div>`:''}
+      ${mode==='cloud'&&getCloudCfg()?`
+      <div style="margin-top:10px;padding:12px 14px;background:rgba(61,213,152,0.07);border:1px solid rgba(61,213,152,0.25);border-radius:8px;font-size:11px;color:var(--text-secondary);">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+          <span>☁️ <strong>Nuvem activa:</strong> ${cloudDbTypeName(getCloudCfg().type)}</span>
+          <span style="display:inline-flex;align-items:center;gap:5px;">
+            <span style="width:8px;height:8px;border-radius:50%;background:${_isOnline?'#00b894':'#e74c3c'};display:inline-block;box-shadow:0 0 5px ${_isOnline?'#00b894':'#e74c3c'}88;"></span>
+            <span style="color:${_isOnline?'#00b894':'#e74c3c'};font-weight:600;">${_isOnline?'Online':'Offline'}</span>
+          </span>
+        </div>
+        <code style="font-size:10px;opacity:.7;display:block;margin-bottom:8px;word-break:break-all;">${getCloudCfg().url}</code>
+        <div style="display:flex;gap:7px;flex-wrap:wrap;">
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncLocalToCloud()">⬆ Enviar para Nuvem</button>
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncCloudToLocal()">⬇ Carregar da Nuvem</button>
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="testCloudConnectionUI()">Testar Ligação</button>
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;color:#e74c3c;" onclick="disconnectCloud()">Desligar</button>
+        </div>
+      </div>`:''}
+      ${mode!=='cloud'&&!getCloudCfg()&&navigator.onLine?`
+      <div style="margin-top:10px;padding:10px 14px;background:rgba(61,213,152,0.05);border:1px dashed rgba(61,213,152,0.3);border-radius:8px;font-size:11px;color:var(--text-muted);cursor:pointer;" onclick="switchDbMode('cloud')">
+        💡 <strong>Dica:</strong> Internet detectada! Clique em <strong>Nuvem Universal</strong> para configurar acesso em múltiplos dispositivos.
+      </div>`:''}
     </div>
 
     <div class="grid-2" style="gap:18px;">
@@ -3025,6 +4297,13 @@ function renderBaseDados() {
                 <div class="db-action-desc">Ficheiro de base de dados — ideal para backup e restauro</div>
               </div>
             </button>
+            <button class="db-action-btn" onclick="exportDB('csv')" style="flex-direction:row;align-items:center;gap:12px;padding:12px;">
+              <div class="db-action-icon" style="background:rgba(62,207,142,0.1);color:#3ECF8E;flex-shrink:0;">${ICONS.download}</div>
+              <div style="flex:1;text-align:left;">
+                <div class="db-action-title" style="margin-bottom:2px;">Exportar como .CSV <span class="chip" style="font-size:9px;margin-left:4px;background:rgba(62,207,142,0.2);color:#3ECF8E;">Supabase</span></div>
+                <div class="db-action-desc">ZIP com tabelas em CSV — compatível com Supabase e PostgreSQL</div>
+              </div>
+            </button>
           </div>
         </div>
       </div>
@@ -3059,6 +4338,14 @@ function renderBaseDados() {
               </div>
               <input type="file" accept=".db,.bandmed" style="display:none;" onchange="importDB(event,'db')">
             </label>
+            <label class="db-action-btn" style="flex-direction:row;align-items:center;gap:12px;padding:12px;cursor:pointer;">
+              <div class="db-action-icon" style="background:rgba(62,207,142,0.1);color:#3ECF8E;flex-shrink:0;">${ICONS.upload}</div>
+              <div style="flex:1;text-align:left;">
+                <div class="db-action-title" style="margin-bottom:2px;">Importar .CSV <span class="chip" style="font-size:9px;margin-left:4px;background:rgba(62,207,142,0.2);color:#3ECF8E;">Supabase</span></div>
+                <div class="db-action-desc">Ficheiro CSV individual (uma tabela de cada vez)</div>
+              </div>
+              <input type="file" accept=".csv" style="display:none;" onchange="importDB(event,'csv')">
+            </label>
           </div>
         </div>
 
@@ -3072,7 +4359,7 @@ function renderBaseDados() {
             </button>
           </div>
           <div style="margin-top:14px;display:flex;flex-direction:column;gap:6px;">
-            ${[['Versão','v3.0.0'],['Armazenamento',mode==='xlsx'?`XLSX (${dirName})`:'localStorage'],['Segurança','SHA-256'],['Utilizador',currentUser?.nome||'—'],['Sessão',new Date().toLocaleString('pt-AO')]].map(([l,v])=>`
+            ${[['Versão','v3.0.0'],['Armazenamento',mode==='xlsx'?`XLSX (${dirName})`:mode==='indexeddb'?'IndexedDB (SQLite)':mode==='firebase'?'Firebase RTDB':mode==='cloud'?('Nuvem — '+(getCloudCfg()?cloudDbTypeName(getCloudCfg().type):'n/a')):'localStorage'],['Segurança','SHA-256'],['Utilizador',currentUser?.nome||'—'],['Sessão',new Date().toLocaleString('pt-AO')]].map(([l,v])=>`
               <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;">
                 <span style="color:var(--text-muted)">${l}</span>
                 <span style="font-weight:500;color:var(--text-secondary);text-align:right;max-width:55%;word-break:break-all;">${v}</span>
@@ -3092,10 +4379,73 @@ async function switchDbMode(mode) {
     if (!ok) return;
     const picked = await pickXlsxFolder();
     if (picked) {
-      // Write current data to xlsx immediately
       await writeXlsxDb(db.data);
       toast('success','Modo XLSX activo','Base de dados será guardada no ficheiro Excel seleccionado');
       renderBaseDados();
+    }
+  } else if (mode === 'indexeddb') {
+    const ok = await confirm('Mudar para IndexedDB',
+      'Os dados serão guardados no IndexedDB do browser — suporta 100.000+ registos sem limite de tamanho. Continuar?');
+    if (!ok) return;
+    setDbMode('indexeddb');
+    xlsxDirHandle = null;
+    toast('info','A migrar dados para IndexedDB...');
+    try {
+      await saveToIDB(db.data);
+      toast('success','Modo IndexedDB activo','Suporta grandes volumes de dados (12.000+ movimentações)');
+    } catch(e) {
+      toast('error','Erro ao migrar para IndexedDB', e.message);
+      setDbMode('localstorage');
+    }
+    renderBaseDados();
+  } else if (mode === 'firebase') {
+    const cfg = getFirebaseStoreCfg();
+    if (!cfg || !cfg.url) {
+      // Sem config: mostrar painel de configuração expandido na UI
+      localStorage.setItem('hmm_show_firebase_config', '1');
+      renderBaseDados();
+      setTimeout(() => {
+        const el = document.getElementById('firebase-store-config');
+        if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.style.boxShadow = '0 0 0 3px #FFA000'; }
+      }, 200);
+      toast('warning', 'Configure o Firebase', 'Preencha o URL e a chave abaixo e clique "Guardar Config", depois clique Firebase novamente.');
+      return;
+    }
+    const ok = await confirm('Mudar para Firebase',
+      `Os dados serão guardados na base de dados Firebase:\n${cfg.url}\nRequer ligação à internet. Continuar?`);
+    if (!ok) return;
+    setDbMode('firebase');
+    xlsxDirHandle = null;
+    localStorage.removeItem('hmm_show_firebase_config');
+    toast('info', 'A enviar dados para Firebase...');
+    try {
+      await saveToFirebaseStore(db.data);
+      toast('success', 'Modo Firebase activo', 'Dados sincronizados com Firebase Realtime Database');
+    } catch(e) {
+      toast('error', 'Erro ao conectar ao Firebase', e.message);
+      setDbMode('localstorage');
+    }
+    renderBaseDados();
+  } else if (mode === 'cloud') {
+    // Se já tem config: reconectar / se não tem: mostrar wizard
+    const cfg = getCloudCfg();
+    if (cfg) {
+      const ok = await confirm('Reconectar Nuvem', `Reconectar a ${cloudDbTypeName(cfg.type)}?
+${cfg.url}`);
+      if (!ok) return;
+      _cloudCfg = cfg;
+      setDbMode('cloud');
+      toast('info','A reconectar à nuvem...');
+      const hasUsers = await CloudDB.checkUsersExist();
+      if (hasUsers) {
+        const cloudUsers = await CloudDB.loadUsers();
+        if (cloudUsers && cloudUsers.length) db.data.usuarios = cloudUsers;
+        toast('success', cloudDbTypeName(cfg.type) + ' activo', 'Dados sincronizados da nuvem.');
+      }
+      renderBaseDados();
+    } else {
+      // Abrir wizard de configuração
+      showCloudSetupWizard();
     }
   } else {
     const ok = await confirm('Mudar para LocalStorage','Os dados voltarão a ser guardados no browser. Continuar?');
@@ -3116,6 +4466,35 @@ async function doReconnectXlsx(e) {
     await db.loadFromXlsx();
     renderBaseDados();
     updateAlertBadge();
+  }
+}
+
+// ===================== FIREBASE STORE CONFIG UI =====================
+async function saveFirebaseStoreCfgUI() {
+  const url = (document.getElementById('fb-store-url')?.value || '').trim().replace(/[/]+$/, '');
+  const key = (document.getElementById('fb-store-key')?.value || '').trim();
+  if (!url) { toast('error', 'URL obrigatório', 'Introduza o URL do Firebase Realtime Database'); return; }
+  saveFirebaseStoreCfg({ url, key });
+  localStorage.removeItem('hmm_show_firebase_config');
+  toast('success', 'Configuração guardada!', 'A activar modo Firebase...');
+  // Activar Firebase automaticamente após guardar config
+  await switchDbMode('firebase');
+}
+
+async function testFirebaseStoreUI() {
+  const url = (document.getElementById('fb-store-url')?.value || '').trim().replace(/\/+$/, '');
+  const key = (document.getElementById('fb-store-key')?.value || '').trim();
+  if (!url) { toast('error', 'URL obrigatório'); return; }
+  toast('info', 'A testar ligação Firebase...');
+  try {
+    const r = await fetch(`${url}/bandmed_ping.json${key ? '?auth=' + key : ''}`);
+    if (r.ok) {
+      toast('success', 'Firebase acessível!', 'Ligação estabelecida com sucesso.');
+    } else {
+      toast('error', 'Erro HTTP ' + r.status, 'Verifique o URL e as regras de segurança do Firebase.');
+    }
+  } catch(e) {
+    toast('error', 'Falha na ligação', e.message);
   }
 }
 
@@ -3145,6 +4524,59 @@ function normalizeImportRow(key, r) {
   else if (obj.ativo === 'TRUE'  || obj.ativo === 'true'  || obj.ativo === 1 || obj.ativo === '1') obj.ativo = true;
   else if (obj.ativo === 'FALSE' || obj.ativo === 'false' || obj.ativo === 0 || obj.ativo === '0') obj.ativo = false;
   else if (typeof obj.ativo === 'number') obj.ativo = obj.ativo !== 0;
+
+  if (key === 'movimentacoes') {
+    // Normalise tipo to uppercase
+    if (obj.tipo) obj.tipo = String(obj.tipo).toUpperCase();
+
+    // Normalise date to DD-MM-YYYY
+    if (obj.data) {
+      const d = String(obj.data);
+      // If YYYY-MM-DD convert to DD-MM-YYYY
+      if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        const [y,m,day] = d.split('-');
+        obj.data = `${day}-${m}-${y}`;
+      }
+      // If Excel serial number (number)
+      else if (/^\d{4,6}$/.test(d)) {
+        try {
+          const epoch = new Date(1899,11,30);
+          epoch.setDate(epoch.getDate() + Number(d));
+          const dd = String(epoch.getDate()).padStart(2,'0');
+          const mm = String(epoch.getMonth()+1).padStart(2,'0');
+          const yyyy = epoch.getFullYear();
+          obj.data = `${dd}-${mm}-${yyyy}`;
+        } catch(e) {}
+      }
+    }
+
+    // If produto_nome is stored as a name string in produto_id column, resolve to id
+    if (obj.produto_id && isNaN(Number(obj.produto_id))) {
+      // produto_id contains a name — try to find the product
+      const nomeBusca = String(obj.produto_id).trim().toLowerCase();
+      const prod = db.getAll('produtos').find(p => p.nome.trim().toLowerCase() === nomeBusca);
+      if (prod) {
+        obj.produto_nome = prod.nome;
+        obj.produto_id = prod.id;
+      } else {
+        obj.produto_nome = String(obj.produto_id);
+        obj.produto_id = null;
+      }
+    } else if (obj.produto_id) {
+      obj.produto_id = Number(obj.produto_id);
+      // Enrich with nome if not present
+      if (!obj.produto_nome) {
+        const prod = db.getById('produtos', obj.produto_id);
+        if (prod) obj.produto_nome = prod.nome;
+      }
+    }
+
+    // Ensure quantidade is a number
+    if (obj.quantidade) obj.quantidade = Number(obj.quantidade) || 0;
+    if (obj.preco && obj.preco !== '') obj.preco = parseFloat(obj.preco) || null;
+    else obj.preco = null;
+  }
+
   return obj;
 }
 
@@ -3178,12 +4610,399 @@ function exportDB(format) {
       const payload = { __type: 'BANDMED_DB', __version: '3.0', exportado: new Date().toISOString(), data };
       downloadBlob(JSON.stringify(payload), `hmm_database_${ts}.db`, 'application/octet-stream');
       toast('success','Exportado como .db','Ficheiro de base de dados gerado com sucesso');
+    } else if (format === 'csv') {
+      // Exportar cada tabela como CSV individual num ZIP (compatível com Supabase/PostgreSQL)
+      exportCSVZip(data, ts);
     }
   } catch(e) { toast('error','Erro ao exportar', e.message); }
 }
 
+// ── CSV helpers ──
+function objectsToCSV(rows) {
+  if (!rows || !rows.length) return '';
+  // Collect all headers from all rows (some may have extra fields)
+  const headers = [];
+  rows.forEach(r => Object.keys(r).forEach(k => { if (!headers.includes(k)) headers.push(k); }));
+  const escape = v => {
+    if (v === null || v === undefined) return '';
+    const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    if (s.includes('"') || s.includes(',') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  const lines = [headers.join(',')];
+  rows.forEach(r => lines.push(headers.map(h => escape(r[h])).join(',')));
+  return lines.join('\r\n');
+}
+
+function csvToObjects(csvText) {
+  const lines = csvText.split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return [];
+  const parseCSVLine = line => {
+    const result = []; let cur = ''; let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQ) {
+        if (c === '"' && line[i+1] === '"') { cur += '"'; i++; }
+        else if (c === '"') inQ = false;
+        else cur += c;
+      } else {
+        if (c === '"') inQ = true;
+        else if (c === ',') { result.push(cur); cur = ''; }
+        else cur += c;
+      }
+    }
+    result.push(cur);
+    return result;
+  };
+  const headers = parseCSVLine(lines[0]);
+  return lines.slice(1).map(line => {
+    const vals = parseCSVLine(line);
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = vals[i] !== undefined ? vals[i] : ''; });
+    return obj;
+  });
+}
+
+async function exportCSVZip(data, ts) {
+  try {
+    // Use JSZip if available, otherwise download CSVs one by one
+    const tables = ['produtos','fornecedores','prateleiras','lotes','movimentacoes','kits'];
+    if (typeof JSZip !== 'undefined') {
+      const zip = new JSZip();
+      tables.forEach(t => {
+        const rows = data[t] || [];
+        zip.file(`${t}.csv`, objectsToCSV(rows));
+      });
+      zip.file('_meta.csv', objectsToCSV([{sistema:'BandMedGest',versao:'3.0',exportado:new Date().toISOString(),utilizador:currentUser?.nome||'—'}]));
+      const blob = await zip.generateAsync({type:'blob'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url;
+      a.download = `bandmed_csv_${ts}.zip`;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      toast('success','Exportado como CSV (ZIP)', `${tables.length} tabelas exportadas — compatível com Supabase`);
+    } else {
+      // Download each table individually
+      tables.forEach(t => {
+        const rows = data[t] || [];
+        if (rows.length) downloadBlob(objectsToCSV(rows), `${t}_${ts}.csv`, 'text/csv;charset=utf-8;');
+      });
+      toast('success','CSVs exportados', 'Cada tabela foi exportada como ficheiro CSV separado');
+    }
+  } catch(e) { toast('error','Erro ao exportar CSV', e.message); }
+}
+
 // ── Manter compatibilidade com chamadas antigas ──
 function exportDBXLSX() { exportDB('xlsx'); }
+
+
+
+// ===================== PARSER XLSX ROBUSTO =====================
+// Auto-contido, sem Web Worker, sem dependências externas.
+// SAX character-by-character: suporta 100k+ linhas sem travar.
+// Regra: linha 1 = cabeçalho; lê até à última linha com dados.
+async function parseXLSXRobust(arrayBuffer, onProgress) {
+  const dec = new TextDecoder();
+  const prog = typeof onProgress === 'function' ? onProgress : ()=>{};
+
+  // ── A. DEFLATE puro JS (fallback sem DecompressionStream) ──
+  function inflatePureJS(data) {
+    const src = data instanceof Uint8Array ? data : new Uint8Array(data);
+    let pos=0,bits=0,buf=0;
+    function rb(n){while(bits<n){buf|=src[pos++]<<bits;bits+=8;}const v=buf&((1<<n)-1);buf>>>=n;bits-=n;return v;}
+    function align(){bits=0;buf=0;}
+    function buildTree(lens){
+      const mx=Math.max(0,...lens);if(!mx)return{lut:new Int32Array(0),mx:0};
+      const cnt=new Int32Array(mx+1);for(const l of lens)if(l)cnt[l]++;
+      const nc=new Int32Array(mx+2);for(let i=1;i<=mx;i++)nc[i+1]=(nc[i]+cnt[i])<<1;
+      const lut=new Int32Array(1<<mx).fill(-1);
+      for(let s=0;s<lens.length;s++){const l=lens[s];if(!l)continue;const c=nc[l]++;let rc=0;for(let i=0;i<l;i++)rc=(rc<<1)|((c>>i)&1);for(let k=rc;k<(1<<mx);k+=(1<<l))lut[k]=(l<<16)|s;}
+      return{lut,mx};
+    }
+    function rSym(t){while(bits<t.mx){buf|=src[pos++]<<bits;bits+=8;}const e=t.lut[buf&((1<<t.mx)-1)];if(e<0)throw new Error('bad sym');buf>>>=(e>>>16);bits-=(e>>>16);return e&0xFFFF;}
+    const FLL=new Uint8Array(288);
+    for(let i=0;i<144;i++)FLL[i]=8;for(let i=144;i<256;i++)FLL[i]=9;for(let i=256;i<280;i++)FLL[i]=7;for(let i=280;i<288;i++)FLL[i]=8;
+    const fL=buildTree([...FLL]),fD=buildTree([...new Uint8Array(32).fill(5)]);
+    const LB=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+    const LE=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+    const DB=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    const DE=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+    let ob=new Uint8Array(Math.max(src.length*6,65536)),op=0;
+    function grow(){const b=new Uint8Array(ob.length*2);b.set(ob);ob=b;}
+    let bfinal=0;
+    do{
+      bfinal=rb(1);const bt=rb(2);
+      if(bt===0){align();const len=rb(16);rb(16);while(op+len>ob.length)grow();for(let i=0;i<len;i++)ob[op++]=rb(8);}
+      else{
+        let lT,dT;
+        if(bt===1){lT=fL;dT=fD;}
+        else{
+          const hl=rb(5)+257,hd=rb(5)+1,hc=rb(4)+4;
+          const co=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+          const cl=new Array(19).fill(0);for(let i=0;i<hc;i++)cl[co[i]]=rb(3);
+          const ct=buildTree(cl);const al=[];
+          while(al.length<hl+hd){const s=rSym(ct);if(s<16)al.push(s);else if(s===16){const r=al[al.length-1];for(let i=rb(2)+3;i--;)al.push(r);}else if(s===17){for(let i=rb(3)+3;i--;)al.push(0);}else{for(let i=rb(7)+11;i--;)al.push(0);}}
+          lT=buildTree(al.slice(0,hl));dT=buildTree(al.slice(hl));
+        }
+        while(true){
+          const sym=rSym(lT);if(sym===256)break;
+          if(sym<256){if(op>=ob.length)grow();ob[op++]=sym;}
+          else{const li=sym-257,len=LB[li]+rb(LE[li]);const di=rSym(dT),dist=DB[di]+rb(DE[di]);const st=op-dist;while(op+len>ob.length)grow();for(let i=0;i<len;i++)ob[op++]=ob[st+i];}
+        }
+      }
+    }while(!bfinal);
+    return ob.subarray(0,op);
+  }
+
+  // ── B. Descompressão (DecompressionStream ou fallback JS) ──
+  async function decompress(data) {
+    const src = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (typeof DecompressionStream !== 'undefined') {
+      for (const fmt of ['deflate-raw','deflate']) {
+        try {
+          const blob = new Blob([src]);
+          const stream = blob.stream().pipeThrough(new DecompressionStream(fmt));
+          const buf = await new Response(stream).arrayBuffer();
+          const out = new Uint8Array(buf);
+          if (out.length > 0) return out;
+        } catch(e) {}
+      }
+    }
+    return inflatePureJS(src);
+  }
+
+  // ── C. Ler ZIP ──
+  prog('A descompactar ficheiro ZIP...');
+  await new Promise(r=>setTimeout(r,0));
+  const b = new Uint8Array(arrayBuffer);
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let eocd = -1;
+  for (let i = b.length-22; i >= 0; i--) {
+    if (b[i]===0x50&&b[i+1]===0x4B&&b[i+2]===0x05&&b[i+3]===0x06) { eocd=i; break; }
+  }
+  if (eocd < 0) throw new Error('Ficheiro ZIP inválido — não é um .xlsx válido');
+  const cnt   = dv.getUint16(eocd+8,  true);
+  const cdOff = dv.getUint32(eocd+16, true);
+  const files  = new Map();
+  let p = cdOff;
+  for (let i = 0; i < cnt; i++) {
+    if (b[p]!==0x50||b[p+1]!==0x4B||b[p+2]!==0x01||b[p+3]!==0x02) break;
+    const nl = dv.getUint16(p+28,true), el=dv.getUint16(p+30,true), cl=dv.getUint16(p+32,true);
+    const method = dv.getUint16(p+10,true), lo=dv.getUint32(p+42,true);
+    const name = dec.decode(b.slice(p+46, p+46+nl));
+    const lnl  = dv.getUint16(lo+26,true), lel=dv.getUint16(lo+28,true);
+    const csz  = dv.getUint32(lo+20,true), ds=lo+30+lnl+lel;
+    const raw  = b.slice(ds, ds+csz);
+    files.set(name, method===8 ? await decompress(raw) : raw);
+    p += 46+nl+el+cl;
+  }
+
+  function getFile(path) {
+    if (files.has(path)) return files.get(path);
+    const lc = path.toLowerCase();
+    for (const [k,v] of files.entries()) if (k.toLowerCase()===lc) return v;
+    const fn = path.split('/').pop().toLowerCase();
+    for (const [k,v] of files.entries()) if (k.split('/').pop().toLowerCase()===fn) return v;
+    return null;
+  }
+  function getText(bytes) {
+    if (!bytes||!bytes.length) return '';
+    try { return dec.decode(bytes); } catch(e) { return ''; }
+  }
+  function xmlAttr(tag, name) {
+    const re = new RegExp('(?:^|\\s)(?:[\\w]+:)?' + name + '\\s*=\\s*"([^"]*)"','i');
+    const m = tag.match(re);
+    return m ? m[1] : '';
+  }
+  function unescXml(s) {
+    return String(s||'').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+      .replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(+n));
+  }
+  function colIdx(ref) {
+    const s=ref.replace(/[0-9]/g,'').toUpperCase(); let ci=0;
+    for(let k=0;k<s.length;k++) ci=ci*26+(s.charCodeAt(k)-64);
+    return ci-1;
+  }
+
+  // ── D. Shared Strings (tokenizer char-by-char) ──
+  prog('A ler strings partilhadas...');
+  await new Promise(r=>setTimeout(r,0));
+  const ssList = [];
+  const ssXml = getText(getFile('xl/sharedStrings.xml'));
+  if (ssXml) {
+    let inSi=false,inT=false,parts=[],i=0,len=ssXml.length;
+    while (i<len) {
+      if (ssXml[i]==='<') {
+        let e=i+1; while(e<len&&ssXml[e]!=='>') { if(ssXml[e]==='"'||ssXml[e]==="'"){const q=ssXml[e++];while(e<len&&ssXml[e]!==q)e++;} e++; }
+        const raw=ssXml.slice(i+1,e).trim(); i=e+1;
+        if(raw[0]==='!'||raw[0]==='?') continue;
+        const isCl=raw[0]==='/';
+        const tn=(isCl?raw.slice(1):raw).split(/[\s/]/)[0].toLowerCase().replace(/^[\w]+:/,'');
+        if(!isCl&&tn==='si')  {inSi=true;parts=[];}
+        else if(isCl&&tn==='si') {if(inSi)ssList.push(parts.join(''));inSi=false;inT=false;}
+        else if(!isCl&&tn==='t'&&inSi) inT=true;
+        else if(isCl&&tn==='t') inT=false;
+      } else {
+        const e2=ssXml.indexOf('<',i);
+        if(inSi&&inT) parts.push(e2===-1?ssXml.slice(i):ssXml.slice(i,e2));
+        i=e2===-1?len:e2;
+      }
+    }
+  }
+
+  // ── E. Relações workbook → ficheiros de folha ──
+  const sheetFiles = new Map();
+  const relXml = getText(getFile('xl/_rels/workbook.xml.rels'));
+  if (relXml) {
+    const rRe=/<[Rr]elationship\s([^/?>]+)/gi; let rm;
+    while((rm=rRe.exec(relXml))!==null) {
+      const tag=rm[1];
+      const id=xmlAttr(tag,'Id'), tgt=xmlAttr(tag,'Target'), type=xmlAttr(tag,'Type');
+      if(!id||!tgt) continue;
+      if(type.includes('worksheet')||tgt.toLowerCase().includes('sheet')) {
+        let path=tgt;
+        if(path.startsWith('/')) path=path.slice(1);
+        else if(!path.startsWith('xl/')) path='xl/'+path;
+        sheetFiles.set(id, path);
+      }
+    }
+  }
+
+  // ── F. Nomes das folhas ──
+  const wbXml = getText(getFile('xl/workbook.xml'));
+  if (!wbXml) throw new Error('workbook.xml não encontrado — ficheiro XLSX corrompido');
+  const sheetDefs = [];
+  const stRe=/<[Ss]heet\s([^/?>]+)/gi; let stm;
+  while((stm=stRe.exec(wbXml))!==null) {
+    const tag=stm[1];
+    const name = xmlAttr(tag,'name') || ('Sheet'+(sheetDefs.length+1));
+    const rId  = xmlAttr(tag,'r:id') || xmlAttr(tag,'id') || ('rId'+(sheetDefs.length+1));
+    sheetDefs.push({name,rId});
+  }
+  if (!sheetDefs.length) throw new Error('Nenhuma folha encontrada no workbook — ficheiro inválido');
+
+  // ── G. Parser SAX de folha (streaming, sem array de tokens) ──
+  // Regra: 1ª linha com dados = cabeçalho; restantes = registos.
+  // Cede ao UI a cada 3000 linhas para não travar o browser.
+  async function parseFolha(wsXml, nomeFolha, totalFolhas, idxFolha) {
+    if (!wsXml) return [];
+    const xml=wsXml, len=xml.length;
+    let i=0;
+
+    // Helpers de avanço inline
+    function skipToGt() { while(i<len&&xml[i]!=='>'){if(xml[i]==='"'||xml[i]==="'"){const q=xml[i++];while(i<len&&xml[i]!==q)i++;}i++;} i++; }
+    function readUntilLt() { const s=i; while(i<len&&xml[i]!=='<')i++; return xml.slice(s,i); }
+
+    // Estado
+    let inSD=false, inRow=false, inC=false, inV=false, inIs=false, inT=false;
+    let cRef='',cType='',cText='',cVal=null;
+    let rowCells={};
+
+    let headers=null;
+    const rows=[];
+    let rowCount=0;
+    const YIELD=3000;
+
+    while (i<len) {
+      // Texto fora de tags — apenas relevante dentro de <v> ou <is><t>
+      if (xml[i]!=='<') {
+        if (inV||(inIs&&inT)) { const s=i; while(i<len&&xml[i]!=='<')i++; cText+=xml.slice(s,i); }
+        else i++;
+        continue;
+      }
+      // Início de tag
+      i++; // saltar '<'
+      if (i>=len) break;
+      if (xml[i]==='!'||xml[i]==='?') { skipToGt(); continue; } // PI / comentário
+
+      const isCl = xml[i]==='/';
+      if (isCl) i++;
+
+      // Nome da tag (sem namespace)
+      const ns=i; while(i<len&&xml[i]!==' '&&xml[i]!=='/'&&xml[i]!=='>') i++;
+      const tn=xml.slice(ns,i).toLowerCase().replace(/^[\w]+:/,'');
+
+      // Atributos (só necessários em <row> e <c>)
+      let aStr='';
+      if (!isCl) {
+        while(i<len&&xml[i]===' ') i++;
+        const as=i;
+        while(i<len&&xml[i]!=='/'&&xml[i]!=='>') { if(xml[i]==='"'||xml[i]==="'"){const q=xml[i++];while(i<len&&xml[i]!==q)i++;} i++; }
+        aStr=xml.slice(as,i);
+      }
+      const isSelf=(i<len&&xml[i]==='/');
+      while(i<len&&xml[i]!=='>') i++; i++; // fechar '>'
+
+      // ── Máquina de estados ──
+      if (!inSD) { if(!isCl&&tn==='sheetdata') inSD=true; continue; }
+      if (isCl&&tn==='sheetdata') break;
+
+      if (!isCl&&tn==='row') {
+        inRow=true; rowCells={}; cRef=''; cType=''; cVal=null; cText='';
+      }
+      else if (isCl&&tn==='row') {
+        // Processar linha completa
+        if (headers===null) {
+          // Linha 1: construir cabeçalhos
+          const maxC=Object.keys(rowCells).reduce((m,k)=>Math.max(m,+k+1),0);
+          headers=[]; for(let c=0;c<maxC;c++) headers.push(String(rowCells[c]??'').trim());
+        } else {
+          // Linhas de dados
+          const obj={}; let hasVal=false;
+          for(let c=0;c<headers.length;c++) {
+            const h=headers[c], val=rowCells[c]??'';
+            if(h!==''){obj[h]=val; if(val!==''&&val!==null&&val!==undefined)hasVal=true;}
+          }
+          if(hasVal) rows.push(obj);
+        }
+        rowCount++;
+        if(rowCount%YIELD===0) {
+          const pct=Math.round((i/len)*100);
+          prog('Folha "'+nomeFolha+'" ('+(idxFolha+1)+'/'+totalFolhas+'): '+rowCount+' linhas — '+pct+'%');
+          await new Promise(r=>setTimeout(r,0));
+        }
+        inRow=false;
+      }
+      else if (inRow&&!isCl&&tn==='c') {
+        // Extrair r= e t= dos atributos
+        const rM=aStr.match(/\br\s*=\s*"([^"]*)"/i), tM=aStr.match(/\bt\s*=\s*"([^"]*)"/i);
+        inC=true; cRef=rM?rM[1]:''; cType=tM?tM[1]:''; cText=''; cVal=null; inV=false; inIs=false;
+        if(isSelf&&cRef){const ci=colIdx(cRef);if(ci>=0)rowCells[ci]='';inC=false;cRef='';}
+      }
+      else if (inRow&&isCl&&tn==='c') {
+        if(cRef){const ci=colIdx(cRef);if(ci>=0)rowCells[ci]=cVal!==null?cVal:'';}
+        inC=false; inV=false; inIs=false; cRef=''; cType=''; cText=''; cVal=null;
+      }
+      else if (inC&&!isCl&&tn==='v') { inV=true; cText=''; }
+      else if (inC&&isCl&&tn==='v') {
+        inV=false;
+        if(cType==='s'){const idx=parseInt(cText,10);cVal=isNaN(idx)?'':(ssList[idx]??'');}
+        else if(cType==='b'){cVal=cText.trim()==='1';}
+        else if(cType==='str'){cVal=unescXml(cText);}
+        else{const n=Number(cText.trim());cVal=(cText.trim()!==''&&!isNaN(n))?n:unescXml(cText);}
+      }
+      else if (inC&&!isCl&&tn==='is') { inIs=true; cText=''; }
+      else if (inC&&isCl&&tn==='is')  { inIs=false; cVal=unescXml(cText); }
+      else if (inC&&!isCl&&tn==='t')  { inT=true; /* cText already accumulating */ }
+      else if (inC&&isCl&&tn==='t')   { inT=false; }
+    }
+    return rows;
+  }
+
+  // ── H. Processar todas as folhas ──
+  const result={};
+  for(let si=0;si<sheetDefs.length;si++) {
+    const {name,rId}=sheetDefs[si];
+    const wsPath=sheetFiles.get(rId)||('xl/worksheets/sheet'+(si+1)+'.xml');
+    const wsXml=getText(getFile(wsPath)||getFile('xl/worksheets/sheet'+(si+1)+'.xml'));
+    prog('A processar folha "'+name+'" ('+(si+1)+'/'+sheetDefs.length+')...');
+    await new Promise(r=>setTimeout(r,0));
+    result[name]=await parseFolha(wsXml,name,sheetDefs.length,si);
+  }
+  return result;
+}
+// ===================== FIM PARSER XLSX ROBUSTO =====================
 
 // ── IMPORTAR (3 formatos) ──
 function importDB(event, format) {
@@ -3196,25 +5015,88 @@ function importDB(event, format) {
     'Lotes':'lotes','Movimentacoes':'movimentacoes','Movimentações':'movimentacoes','Kits':'kits',
     'produtos':'produtos','fornecedores':'fornecedores','prateleiras':'prateleiras',
     'lotes':'lotes','movimentacoes':'movimentacoes','kits':'kits',
+    'movimentações':'movimentacoes','Medicamentos':'produtos','medicamentos':'produtos',
+    'Sheet1':'produtos','Sheet2':'movimentacoes','sheet1':'produtos','sheet2':'movimentacoes',
   };
 
   async function applyImport(dataObj) {
     // dataObj: { produtos:[...], fornecedores:[...], ... }
     const keys = Object.keys(dataObj).filter(k => Array.isArray(dataObj[k]));
+    if (!keys.length) { toast('error','Sem dados reconhecidos','Nenhuma tabela válida encontrada no ficheiro.'); return; }
     const names = keys.map(k => k.charAt(0).toUpperCase()+k.slice(1));
+    const totalRows = keys.reduce((s,k) => s + (dataObj[k]||[]).length, 0);
+    const mode = getDbMode();
+
+    // Aviso se modo LocalStorage e muitos registos
+    let extraWarn = '';
+    if (mode === 'localstorage' && totalRows > 400) {
+      extraWarn = `\n\n⚠️ ATENÇÃO: O ficheiro tem ${totalRows} registos. O LocalStorage suporta ~500. Recomenda-se mudar para IndexedDB na secção "Modo de Armazenamento".`;
+    }
+
     const ok = await confirm('Importar Base de Dados',
-      `Encontradas: ${names.join(', ')}.\nImportar substituirá os dados actuais (exceto utilizadores). Continuar?`);
+      `Encontradas: ${names.join(', ')} (${totalRows} registos total).\nImportar substituirá os dados actuais (exceto utilizadores). Continuar?${extraWarn}`);
     if (!ok) return;
+
+    toast('info', 'A importar dados...', 'Por favor aguarde, pode demorar alguns segundos.');
+
     let imported = 0;
-    keys.forEach(key => {
+    // Processar em chunks para não travar o browser com grandes datasets
+    for (const key of keys) {
       const data = dataObj[key];
       if (Array.isArray(data) && data.length && !data[0].info) {
-        db.data[key] = data.map(r => normalizeImportRow(key, r));
+        // Normalizar em batches de 500
+        const normalized = [];
+        const BATCH = 500;
+        for (let i = 0; i < data.length; i += BATCH) {
+          const batch = data.slice(i, i + BATCH).map(r => normalizeImportRow(key, r));
+          normalized.push(...batch);
+          // Yield para não bloquear o UI em datasets grandes
+          if (i + BATCH < data.length) await new Promise(r => setTimeout(r, 0));
+        }
+        db.data[key] = normalized;
         imported++;
       }
-    });
-    db.save();
-    toast('success','Base de dados importada', `${imported} tabela(s) importada(s) com sucesso.`);
+    }
+
+    // Salvar — se IndexedDB, aguardar a escrita
+    if (mode === 'indexeddb') {
+      try {
+        await saveToIDB(db.data);
+        // Guardar só users no localStorage
+        try { localStorage.setItem(DB_KEY, JSON.stringify({ usuarios: db.data.usuarios })); } catch(e) {}
+        toast('success','Base de dados importada', `${imported} tabela(s) importada(s) — ${totalRows} registos guardados no IndexedDB.`);
+      } catch(e) {
+        toast('error','Erro ao guardar no IndexedDB', e.message);
+        return;
+      }
+    } else if (mode === 'firebase') {
+      try {
+        await saveToFirebaseStore(db.data);
+        toast('success','Base de dados importada', `${imported} tabela(s) enviadas para Firebase — ${totalRows} registos.`);
+      } catch(e) {
+        toast('error','Erro ao enviar para Firebase', e.message);
+        return;
+      }
+    } else {
+      // LocalStorage — tenta salvar, avisa se falhar
+      try {
+        localStorage.setItem(DB_KEY, JSON.stringify(db.data));
+        toast('success','Base de dados importada', `${imported} tabela(s) importada(s) com sucesso.`);
+      } catch(lsErr) {
+        // Dados demasiado grandes para localStorage — migrar automaticamente para IDB
+        toast('warning','LocalStorage cheio!', 'A migrar automaticamente para IndexedDB...');
+        try {
+          await saveToIDB(db.data);
+          setDbMode('indexeddb');
+          try { localStorage.setItem(DB_KEY, JSON.stringify({ usuarios: db.data.usuarios })); } catch(e) {}
+          toast('success','Migrado para IndexedDB!', `${totalRows} registos guardados sem limites de tamanho.`);
+        } catch(idbErr) {
+          toast('error','Erro ao guardar dados', 'LocalStorage cheio e IndexedDB falhou: ' + idbErr.message);
+          return;
+        }
+      }
+    }
+
     renderBaseDados();
     updateAlertBadge();
   }
@@ -3250,27 +5132,95 @@ function importDB(event, format) {
     };
     reader.readAsText(file);
 
+  } else if (format === 'csv') {
+    // CSV individual — detectar nome da tabela pelo nome do ficheiro
+    const reader = new FileReader();
+    reader.onerror = () => toast('error','Erro ao ler ficheiro CSV');
+    reader.onload = async (e) => {
+      try {
+        const rows = csvToObjects(e.target.result);
+        if (!rows.length) { toast('error','CSV vazio','O ficheiro CSV não contém dados.'); return; }
+        // Detect table from filename: e.g. "movimentacoes_2024-10-22.csv" → "movimentacoes"
+        const nameLower = file.name.toLowerCase().replace(/\.csv$/,'').split('_')[0];
+        const tableName = tableMap[nameLower] || tableMap[file.name.toLowerCase().replace(/\.csv$/,'')];
+        if (!tableName) {
+          toast('error','Tabela não reconhecida',
+            `O ficheiro "${file.name}" não corresponde a nenhuma tabela. Use nomes como: produtos, fornecedores, lotes, movimentacoes, kits.`);
+          return;
+        }
+        const mode = getDbMode();
+        let extraWarnCsv = '';
+        if (mode === 'localstorage' && rows.length > 400) {
+          extraWarnCsv = `\n\n⚠️ ${rows.length} registos podem exceder o limite do LocalStorage. Recomenda-se IndexedDB.`;
+        }
+        const ok = await confirm('Importar CSV',
+          `Importar ${rows.length} registos para "${tableName}" a partir de "${file.name}"?\nOs dados actuais de "${tableName}" serão substituídos.${extraWarnCsv}`);
+        if (!ok) return;
+        toast('info', 'A importar CSV...', 'Por favor aguarde...');
+        // Normalizar em batches
+        const normalizedCsv = [];
+        const BATCH_CSV = 500;
+        for (let i = 0; i < rows.length; i += BATCH_CSV) {
+          const batch = rows.slice(i, i + BATCH_CSV).map(r => normalizeImportRow(tableName, r));
+          normalizedCsv.push(...batch);
+          if (i + BATCH_CSV < rows.length) await new Promise(r => setTimeout(r, 0));
+        }
+        db.data[tableName] = normalizedCsv;
+        if (mode === 'indexeddb') {
+          try { await saveToIDB(db.data); } catch(e) { toast('error','Erro IDB', e.message); return; }
+        } else if (mode === 'firebase') {
+          try { await saveToFirebaseStore(db.data); } catch(e) { toast('error','Erro Firebase', e.message); return; }
+        } else {
+          try {
+            localStorage.setItem(DB_KEY, JSON.stringify(db.data));
+          } catch(lsErr) {
+            toast('warning','LocalStorage cheio! A migrar para IndexedDB...');
+            try {
+              await saveToIDB(db.data);
+              setDbMode('indexeddb');
+              localStorage.setItem(DB_KEY, JSON.stringify({ usuarios: db.data.usuarios }));
+            } catch(idbErr) { toast('error','Erro ao guardar', idbErr.message); return; }
+          }
+        }
+        toast('success','CSV importado', `${rows.length} registos importados para "${tableName}"`);
+        renderBaseDados(); updateAlertBadge();
+      } catch(err) { toast('error','Erro ao importar CSV', err.message || 'Ficheiro inválido'); }
+    };
+    reader.readAsText(file, 'UTF-8');
+
   } else {
-    // XLSX — usar Web Worker para não travar
-    toast('info','A processar ficheiro XLSX...','A ler em segundo plano — o sistema não vai travar');
+    // XLSX: parser directo sem Web Worker — funciona em qualquer browser/mobile
     const reader = new FileReader();
     reader.onerror = () => toast('error','Erro ao ler ficheiro');
     reader.onload = async (e) => {
       let sheets = {};
-      try { sheets = await parseXLSXInWorker(e.target.result); }
-      catch(we) {
-        try { sheets = await XLSXio.read(e.target.result); }
-        catch(de) { toast('error','Erro ao importar', de.message || 'XLSX inválido'); return; }
+      try {
+        sheets = await parseXLSXRobust(e.target.result, (msg) => {
+          toast('info', 'A importar XLSX...', msg);
+        });
+      } catch(err) {
+        toast('error','Erro ao importar XLSX', err.message || 'Ficheiro inválido');
+        return;
       }
-      if (!Object.keys(sheets).length) {
+      const sheetNames = Object.keys(sheets);
+      if (!sheetNames.length) {
         toast('error','Ficheiro vazio','Nenhuma folha encontrada. Use .xlsx (Excel 2007+).');
         return;
       }
       const normalized = {};
       Object.entries(sheets).forEach(([k, v]) => {
-        const mapped = tableMap[k] || tableMap[k.toLowerCase()];
+        const trimmed = k.trim();
+        const noAccent = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+        const mapped = tableMap[trimmed] || tableMap[trimmed.toLowerCase()]
+                    || tableMap[noAccent] || tableMap[noAccent.toLowerCase()];
         if (mapped) normalized[mapped] = v;
       });
+      if (!Object.keys(normalized).length) {
+        const found = sheetNames.join(', ');
+        toast('error','Folhas não reconhecidas',
+          'Folhas no ficheiro: "' + found + '".\nEsperados: Produtos, Movimentacoes, Fornecedores, Prateleiras, Lotes, Kits.');
+        return;
+      }
       await applyImport(normalized);
     };
     reader.readAsArrayBuffer(file);
@@ -3585,16 +5535,16 @@ function doGet(e){
         <div class="sync-icon" style="background:rgba(52,152,219,0.1);color:var(--info);">${ICONS.settings}</div>
         <div><div class="sync-card-title">Escolher Serviço Cloud</div></div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px;">
         ${[
           ['none','Nenhum','Sem sincronização cloud','rgba(90,122,155,0.15)','var(--text-muted)'],
           ['sheets','Google Sheets','Via Google Apps Script','rgba(52,152,219,0.15)','var(--info)'],
           ['supabase','Supabase','Base de dados PostgreSQL','rgba(62,207,142,0.15)','#3ECF8E'],
           ['firebase','Firebase','Google Firebase RTDB','rgba(255,160,0,0.15)','#FFA000'],
         ].map(([id,label,desc,bg,col])=>`
-          <div onclick="selectSyncProvider('${id}')" style="cursor:pointer;padding:12px;border-radius:var(--radius-sm);border:2px solid ${prov===id?col:'var(--border)'};background:${prov===id?bg:'var(--bg-card)'};transition:var(--transition);text-align:center;">
+          <div onclick="selectSyncProvider('${id}')" style="cursor:pointer;padding:12px;border-radius:var(--radius-sm);border:2px solid ${prov===id?col:'var(--border)'};background:${prov===id?bg:'var(--bg-card)'};transition:var(--transition);text-align:center;min-height:80px;display:flex;flex-direction:column;align-items:center;justify-content:center;">
             <div style="font-weight:700;font-size:13px;color:${prov===id?col:'var(--text-secondary)'};">${label}</div>
-            <div style="font-size:10px;color:var(--text-muted);margin-top:3px;">${desc}</div>
+            <div style="font-size:10px;color:var(--text-muted);margin-top:3px;line-height:1.3;">${desc}</div>
             ${prov===id?`<div style="margin-top:6px;"><span class="badge badge-success" style="font-size:9px;">Activo</span></div>`:''}
           </div>
         `).join('')}
@@ -4144,15 +6094,21 @@ function gerarFichaStock() {
   const movs = db.getAll('movimentacoes')
     .filter(m => Number(m.produto_id) === prodId)
     .sort((a,b) => {
-      const da = a.data||'', db2 = b.data||'';
-      return da.localeCompare(db2) || Number(a.id) - Number(b.id);
+      const toISO = d => {
+        if (!d) return '';
+        const s = String(d);
+        // DD-MM-YYYY → YYYY-MM-DD para ordenação cronológica correcta
+        if (/^\d{2}-\d{2}-\d{4}$/.test(s)) { const [day,m,y]=s.split('-'); return `${y}-${m}-${day}`; }
+        return s;
+      };
+      return toISO(a.data).localeCompare(toISO(b.data)) || Number(a.id) - Number(b.id);
     });
 
   // Calculate running stock for each movement
   let runningStock = 0;
   const movsWithStock = movs.map(m => {
     const q = Number(m.quantidade) || 0;
-    if (m.tipo === 'Entrada') runningStock += q;
+    if ((m.tipo||'').toUpperCase() === 'ENTRADA') runningStock += q;
     else runningStock -= q;
     return { ...m, stockApos: runningStock };
   });
@@ -4160,8 +6116,11 @@ function gerarFichaStock() {
   // Build rows HTML
   const fmtDate = d => {
     if (!d) return '';
+    const s = String(d);
+    if (/^\d{2}-\d{2}-\d{4}$/.test(s)) return s;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) { const [y,m,day]=s.split('-'); return `${day}-${m}-${y}`; }
     try { return new Date(d).toLocaleDateString('pt-AO', {day:'2-digit',month:'2-digit',year:'numeric'}); }
-    catch { return d; }
+    catch { return s; }
   };
 
   // Up to 8 lots shown in header
@@ -4191,7 +6150,7 @@ function gerarFichaStock() {
 
   // Movement rows
   const movRows = movsWithStock.map((m, idx) => {
-    const isEntrada = m.tipo === 'Entrada';
+    const isEntrada = (m.tipo||'').toUpperCase() === 'ENTRADA';
     const lot = m.lote_id ? db.getById('lotes', m.lote_id) : null;
     const valor = m.preco ? (Number(m.quantidade) * Number(m.preco)).toFixed(2) : '';
     const stockValor = m.preco ? (m.stockApos * Number(m.preco)).toFixed(2) : '';
@@ -4385,6 +6344,10 @@ function closeModal(id) {
   if (el) el.classList.remove('open');
   editingId = null;
   userEditingId = null;
+  // Se é o modal de movimentações, fechar e remover a combobox do body
+  if (id === 'modal-mov') {
+    closeMovCombo();
+  }
 }
 
 document.addEventListener('click', (e) => {
@@ -4392,6 +6355,8 @@ document.addEventListener('click', (e) => {
     e.target.classList.remove('open');
     editingId = null;
     userEditingId = null;
+    // Fechar combobox se estiver aberta
+    closeMovCombo();
   }
 });
 
@@ -4409,10 +6374,76 @@ document.getElementById('confirm-no').addEventListener('click', () => {
 document.getElementById('header-notif-btn').addEventListener('click', () => navigateTo('alertas'));
 
 // ===================== BOOTSTRAP =====================
+// Aviso quando o browser fecha com gravação IDB em curso
+window.addEventListener('beforeunload', (e) => {
+  if (_idbPending > 0) {
+    e.preventDefault();
+    e.returnValue = 'Uma gravação na base de dados está em curso. Fechar agora pode causar perda de dados.';
+  }
+});
+
 document.addEventListener('DOMContentLoaded', () => {
-  showScreen('splash');
-  startSplash();
+  // ── IndexedDB: pré-carregar dados antes de mostrar o ecrã de login ──────────
+  // Quando o modo é IndexedDB, os dados completos residem no IDB, não no localStorage.
+  // É necessário carregar do IDB ainda antes de mostrar o login para que os utilizadores
+  // (e outros dados em memória) estejam disponíveis imediatamente.
+  const _preloadIDB = getDbMode() === 'indexeddb'
+    ? loadFromIDB().then(idbData => {
+        if (idbData) {
+          // Mesclar com a cópia em memória: preferir utilizadores do localStorage (mais seguros)
+          const lsUsers = (() => {
+            try { const r = localStorage.getItem(DB_KEY); return r ? (JSON.parse(r).usuarios || []) : []; } catch(e) { return []; }
+          })();
+          db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...idbData };
+          if (lsUsers.length) db.data.usuarios = lsUsers;
+          console.log('[IDB] Pré-carregamento na inicialização concluído — ' + db.data.usuarios.length + ' utilizador(es).');
+        } else {
+          console.info('[IDB] IndexedDB vazio no arranque — a aguardar primeiro save ou migração.');
+        }
+      }).catch(e => console.warn('[IDB] Erro no pré-carregamento:', e))
+    : Promise.resolve();
+
   setupLogin();
+
+  const _cloudCfgSaved = getCloudCfg();
+  const _mode = getDbMode();
+
+  if (_cloudCfgSaved && _mode === 'cloud') {
+    // Configuração de nuvem existente → reconectar automaticamente
+    showScreen('splash');
+    startSplash(async () => {
+      await _preloadIDB; // Aguardar IDB (no-op para modo cloud)
+      await cloudAutoReconnect(() => {});
+      showScreen('login');
+    });
+  } else {
+    // Sem configuração de nuvem → fluxo normal
+    showScreen('splash');
+    startSplash(async () => {
+      // Garantir que o IDB foi pré-carregado antes de decidir o ecrã a mostrar
+      await _preloadIDB;
+
+      // Online sem configuração de nuvem: mostrar wizard SEMPRE (mesmo com utilizadores locais)
+      // Excepto se o utilizador já ignorou o wizard nesta sessão
+      const _wizardSkipped = sessionStorage.getItem('hmm_cloud_wizard_skipped');
+      if (navigator.onLine && !getCloudCfg() && !_wizardSkipped) {
+        if (db.data.usuarios.length === 0) {
+          showScreen('setup'); // por baixo do wizard
+          setupFirstRun();
+        } else {
+          showScreen('login');
+        }
+        showCloudSetupWizard();
+      } else if (db.data.usuarios.length === 0) {
+        showScreen('setup');
+        setupFirstRun();
+      } else {
+        showScreen('login');
+      }
+      // Atualizar badge de rede após splash
+      updateNetworkStatusUI();
+    });
+  }
 });
 
 // ===================== KITS PAGE =====================
@@ -4447,7 +6478,6 @@ function renderKits() {
         <div class="table-title">${ICONS.list} Kits Cadastrados <span class="chip">${filtered.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <span class="search-icon">${ICONS.search}</span>
             <input class="search-input" id="search-kits" placeholder="Pesquisar kit..." value="${kitSearch}" oninput="kitSearch=this.value;filterKitsTable()">
           </div>
         </div>
@@ -4458,7 +6488,7 @@ function renderKits() {
         <tbody id="tbody-kits">
           ${filtered.length ? filtered.map(k=>{
             const comps = Array.isArray(k.componentes) ? k.componentes : [];
-            const saidas = db.getAll('movimentacoes').filter(m=>m.kit_id===k.id&&m.tipo==='Saída').length;
+            const saidas = db.getAll('movimentacoes').filter(m=>m.kit_id===k.id&&(m.tipo||'').toUpperCase()==='SAÍDA').length;
             return `<tr>
               <td class="td-name">
                 <div style="display:flex;align-items:center;gap:8px;">
@@ -4687,7 +6717,7 @@ async function saveKitSaida() {
   if (!k) return;
   const qtdKits = parseInt(document.getElementById('kit-saida-qtd').value)||1;
   const destino = document.getElementById('kit-saida-destino').value;
-  const data = document.getElementById('kit-saida-data').value || new Date().toISOString().split('T')[0];
+  const data = dateInputToStorage(document.getElementById('kit-saida-data').value) || today();
   const comps = Array.isArray(k.componentes) ? k.componentes : [];
 
   // Stock check
@@ -4710,7 +6740,8 @@ async function saveKitSaida() {
     const p = db.getById('produtos', c.produto_id);
     db.insert('movimentacoes', {
       produto_id: c.produto_id,
-      tipo: 'Saída',
+      produto_nome: db.getById('produtos', c.produto_id)?.nome || `Produto #${c.produto_id}`,
+      tipo: 'SAÍDA',
       lote_id: null,
       quantidade: c.quantidade * qtdKits,
       destino: `Kit: ${k.nome}${destino?' → '+destino:''}`,
@@ -4827,8 +6858,7 @@ function renderLogs() {
         <div style="flex:1;min-width:180px;">
           <div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em;">Pesquisar</div>
           <div style="position:relative;">
-            <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-muted);width:16px;height:16px;display:inline-flex;">${ICONS.search}</span>
-            <input class="field-input" id="search-logs" style="padding-left:34px;" placeholder="Descrição ou utilizador…" value="${logsFilter.search}" oninput="logsFilter.search=this.value;logsPage=1;filterLogsTable()">
+            <input class="field-input" id="search-logs" style="padding-left:10px;" placeholder="Descrição ou utilizador…" value="${logsFilter.search}" oninput="logsFilter.search=this.value;logsPage=1;filterLogsTable()">
           </div>
         </div>
         <div style="min-width:150px;">
@@ -4959,20 +6989,32 @@ function openMovCombo() {
   let list = document.getElementById('combo-mov-produto-list');
   if (!input || !list) return;
 
-  // Move the dropdown to <body> the first time so it escapes modal's stacking context
+  // Always repopulate with fresh product list
+  const produtos = db.getAll('produtos');
+  list.innerHTML = produtos.map(p => {
+    const {stock} = db.getStock(p.id);
+    return `<div class="combo-option" data-id="${p.id}" data-nome="${p.nome.replace(/"/g,'&quot;')}" onmousedown="selectMovCombo(${p.id},this.dataset.nome)"><span class="combo-opt-nome">${p.nome}</span><span class="combo-opt-stock ${stock<=0?'combo-stock-zero':stock<=(p.stock_minimo||0)?'combo-stock-low':'combo-stock-ok'}">${stock} un.</span></div>`;
+  }).join('');
+
+  // Move the dropdown to <body> to escape modal's stacking context
   if (list.parentElement !== document.body) {
     document.body.appendChild(list);
   }
 
   // Position it precisely below the input using fixed coords
   const rect = input.getBoundingClientRect();
+  list.style.position = 'fixed';
   list.style.top   = (rect.bottom + 2) + 'px';
   list.style.left  = rect.left + 'px';
   list.style.width = rect.width + 'px';
   list.style.display = 'block';
+  list.style.zIndex = '99999';
+
+  // Filter with current input value
   filterMovCombo(input.value);
 
   // Reposition on scroll/resize
+  if (list._repositionFn) window.removeEventListener('scroll', list._repositionFn, true);
   list._repositionFn = () => {
     const r = input.getBoundingClientRect();
     list.style.top  = (r.bottom + 2) + 'px';
@@ -4989,11 +7031,29 @@ function closeMovCombo() {
     window.removeEventListener('scroll', list._repositionFn, true);
     list._repositionFn = null;
   }
+  // Se o dropdown foi movido para o body, devolvê-lo ao wrap original
+  const wrap = document.getElementById('combo-mov-produto-wrap');
+  if (wrap && list.parentElement === document.body) {
+    list.style.position = '';
+    list.style.top = '';
+    list.style.left = '';
+    list.style.width = '';
+    list.style.zIndex = '';
+    wrap.appendChild(list);
+  }
 }
 
 function filterMovCombo(query) {
   const list = document.getElementById('combo-mov-produto-list');
-  if (!list) return;
+  const input = document.getElementById('combo-mov-produto-input');
+  if (!list || !input) return;
+
+  // Se dropdown não está visível, abrir (sem recursão: openMovCombo chama filterMovCombo no final)
+  if (list.style.display === 'none' || list.style.display === '') {
+    openMovCombo();
+    return;
+  }
+
   list.style.display = 'block';
   const q = (query || '').toLowerCase().trim();
   let anyVisible = false;
@@ -5018,8 +7078,10 @@ function filterMovCombo(query) {
 }
 
 function selectMovCombo(id, nome) {
-  document.getElementById('mov-produto').value = id;
-  document.getElementById('combo-mov-produto-input').value = nome;
+  const hiddenInput = document.getElementById('mov-produto');
+  const textInput = document.getElementById('combo-mov-produto-input');
+  if (hiddenInput) hiddenInput.value = id;
+  if (textInput) textInput.value = nome;
   closeMovCombo();
   updateMovLotes();
 }
@@ -5071,6 +7133,15 @@ function filterProdutosTable() {
   if (inp) { const l = inp.value.length; inp.setSelectionRange(l, l); }
 }
 
+function renderLotesFiltered() {
+  filterLotesTable();
+  // Ensure search input retains focus after DOM update
+  requestAnimationFrame(() => {
+    const inp = document.getElementById('search-lotes');
+    if (inp) { inp.focus(); const l = inp.value.length; inp.setSelectionRange(l, l); }
+  });
+}
+
 function filterLotesTable() {
   // Update only the tbody — the search input stays focused
   const tbody = document.getElementById('tbody-lotes');
@@ -5098,27 +7169,32 @@ function filterLotesTable() {
     const forn = db.getById('fornecedores', l.fornecedor_id);
     const st   = getLotStatus(l.validade);
     const dias = daysUntil(l.validade);
-    return `<tr>
-      <td class="font-mono text-accent">${l.numero_lote}</td>
+    const stockActual = db.getLoteStock(l.id);
+    const isBloqueado = !!l.bloqueado;
+    return `<tr style="${isBloqueado?'opacity:0.65;background:var(--bg-tertiary,#f5f5f5);':''}">
+      <td class="font-mono text-accent">${l.numero_lote}${isBloqueado?` <span style="color:var(--danger,#dc3545);font-size:10px;">🔒</span>`:''}</td>
       <td class="td-name">${prod ? prod.nome : '—'}</td>
       <td>${forn ? forn.nome : '—'}</td>
       <td class="font-bold">${l.quantidade||0}</td>
+      <td class="font-bold ${stockActual<0?'text-danger':stockActual===0?'text-muted':'text-accent'}">${stockActual}</td>
       <td>${formatDate(l.validade)}</td>
       <td class="${dias<0?'text-danger':dias<=90?'text-warning':'text-accent'}">${dias<0?`Há ${Math.abs(dias)}d`:dias===Infinity?'—':`${dias}d`}</td>
       <td class="font-mono text-muted">${l.codigo_barra||'—'}</td>
       <td><span class="badge ${st.cls}">${st.label}</span></td>
       <td>
         <div style="display:flex;gap:5px;">
+          <button class="btn btn-secondary btn-icon" title="${isBloqueado?'Desbloquear lote':'Bloquear lote'}" onclick="toggleLoteBloqueado(${l.id})" style="${isBloqueado?'color:var(--warning,#ffc107);':''}">${isBloqueado?ICONS.unlock:ICONS.lock}</button>
           <button class="btn btn-secondary btn-icon" onclick="openLoteModal(${l.id})">${ICONS.edit}</button>
           <button class="btn btn-danger btn-icon" onclick="deleteLote(${l.id})">${ICONS.trash}</button>
         </div>
       </td>
     </tr>`;
-  }).join('') : `<tr><td colspan="9"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado${loteSearch?' para "<strong>'+loteSearch+'</strong>"':''}</p></div></td></tr>`;
+  }).join('') : `<tr><td colspan="10"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado${loteSearch?' para "<strong>'+loteSearch+'</strong>"':''}</p></div></td></tr>`;
 
   // Restore focus at end of text
   const inp = document.getElementById('search-lotes');
-  if (inp) { const l = inp.value.length; inp.setSelectionRange(l, l); }
+  if (inp && document.activeElement !== inp) { inp.focus(); }
+  if (inp) { setTimeout(()=>{ const l = inp.value.length; inp.setSelectionRange(l, l); }, 0); }
 }
 
 // ===================== TABLE-ONLY FILTER: FORNECEDORES =====================
@@ -5157,44 +7233,10 @@ function filterFornecedoresTable() {
 // ===================== TABLE-ONLY FILTER: MOVIMENTAÇÕES =====================
 function filterMovimentacoesTable() {
   const tbody = document.getElementById('tbody-movimentacoes');
-  const counter = document.querySelector('#page-movimentacoes .table-title .chip');
-  if (!tbody) { renderMovimentacoes(); return; }
-
-  let movs = db.getAll('movimentacoes');
-  if (movSearch) movs = movs.filter(m =>
-    (db.getById('produtos', m.produto_id)?.nome||'').toLowerCase().includes(movSearch.toLowerCase()) ||
-    (m.destino||'').toLowerCase().includes(movSearch.toLowerCase())
-  );
-  if (movFilter !== 'todos') movs = movs.filter(m => m.tipo === movFilter);
-  if (movDateFrom) movs = movs.filter(m => m.data >= movDateFrom);
-  if (movDateTo)   movs = movs.filter(m => m.data <= movDateTo);
-  const sortedMovs = [...movs].sort((a,b) => new Date(b.data) - new Date(a.data));
-
-  if (counter) counter.textContent = sortedMovs.length;
-  tbody.innerHTML = sortedMovs.length ? sortedMovs.map(m => {
-    const prod = db.getById('produtos', m.produto_id);
-    const lot  = db.getById('lotes', m.lote_id);
-    return `<tr>
-      <td class="td-name">${prod ? prod.nome : '—'}</td>
-      <td><span class="badge ${m.tipo==='Entrada'?'badge-success':'badge-danger'}">${m.tipo==='Entrada'?ICONS.arrow_up:ICONS.arrow_down} ${m.tipo}</span></td>
-      <td class="font-mono text-muted">${lot ? lot.numero_lote : '—'}</td>
-      <td class="font-bold ${m.tipo==='Entrada'?'text-accent':'text-danger'}">${m.quantidade}</td>
-      <td>${m.destino||'—'}</td>
-      <td>${m.preco ? formatMoney(m.preco) : '—'}</td>
-      <td>${formatDate(m.data)}</td>
-      <td>
-        <div style="display:flex;gap:5px;">
-          <button class="btn btn-secondary btn-icon" onclick="openMovModal(${m.id})">${ICONS.edit}</button>
-          <button class="btn btn-danger btn-icon" onclick="deleteMov(${m.id})">${ICONS.trash}</button>
-        </div>
-      </td>
-    </tr>`;
-  }).join('')
-  : `<tr><td colspan="8"><div class="table-empty">${ICONS.movement}<p>Nenhuma movimentação encontrada</p></div></td></tr>`;
-
-  const inp = document.getElementById('search-movimentacoes');
-  if (inp) { const l = inp.value.length; inp.setSelectionRange(l, l); }
+  if (!tbody) { movPage=0; _renderMovimentacoesUI(); return; }
+  _updateMovTbody();
 }
+
 
 // ===================== TABLE-ONLY FILTER: KITS =====================
 function filterKitsTable() {
@@ -5208,7 +7250,7 @@ function filterKitsTable() {
   if (counter) counter.textContent = filtered.length;
   tbody.innerHTML = filtered.length ? filtered.map(k => {
     const comps = Array.isArray(k.componentes) ? k.componentes : [];
-    const saidas = db.getAll('movimentacoes').filter(m => m.kit_id === k.id && m.tipo === 'Saída').length;
+    const saidas = db.getAll('movimentacoes').filter(m => m.kit_id === k.id && (m.tipo||'').toUpperCase() === 'SAÍDA').length;
     return `<tr>
       <td class="td-name">
         <div style="display:flex;align-items:center;gap:8px;">
