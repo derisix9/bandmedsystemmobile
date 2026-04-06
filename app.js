@@ -1303,14 +1303,16 @@ async function handleGoOnline() {
   const cfg = getCloudCfg();
   const mode = getDbMode();
   if (cfg && mode === 'cloud') {
-    toast('info', '🌐 Ligação restabelecida', 'A sincronizar dados locais com a nuvem...');
+    toast('info', '🌐 Ligação restabelecida', 'A sincronizar dados locais com a nuvem (merge inteligente)...');
     await syncLocalToCloud();
-  } else if (cfg && mode !== 'cloud') {
-    toast('info', '🌐 Internet detectada', 'Nuvem disponível — aceda a Base de Dados para reconectar.');
+  } else if (cfg && (mode === 'indexeddb' || mode === 'localstorage' || mode === 'xlsx')) {
+    // Mesmo em modo local, se há config de nuvem, faz merge automático ao recuperar internet
+    toast('info', '🌐 Ligação restabelecida', 'A sincronizar dados locais com a nuvem (merge inteligente)...');
+    await syncLocalToCloud();
   } else if (!cfg) {
-    // Online but no cloud config: offer wizard if not already open
-    if (!document.getElementById('cloud-setup-overlay')) {
-      toast('info', '🌐 Internet detectada', 'Configure a nuvem em Base de Dados para sincronizar dados.');
+    // Sem configuração de nuvem: mostrar wizard automaticamente (se ainda não estiver aberto)
+    if (!document.getElementById('cloud-setup-overlay') && !sessionStorage.getItem('hmm_cloud_wizard_skipped')) {
+      showCloudSetupWizard();
     }
   }
 }
@@ -1328,55 +1330,167 @@ function handleGoOffline() {
 window.addEventListener('online',  () => handleGoOnline());
 window.addEventListener('offline', () => handleGoOffline());
 
-// ── Sincronizar dados locais → nuvem ──
+// ===================== MOTOR DE MERGE INTELIGENTE =====================
+// Regras:
+//   - INSERT: registo local que não existe na nuvem → adiciona na nuvem
+//   - UPDATE: registo existe em ambos → vence o _updatedAt mais recente
+//   - DELETE: registo marcado com ativo:false na fonte mais recente → propaga
+//   - NUNCA apaga toda a BD na nuvem para reescrever
+//
+// Suporte: IndexedDB, localStorage, XLSX → Nuvem (Firebase RTDB / Supabase / REST)
+
+const SYNC_TABLES = ['produtos','fornecedores','prateleiras','lotes','movimentacoes','kits','usuarios','logs'];
+
+/**
+ * Faz merge de dois arrays de registos pelo campo id.
+ * @param {Array} localArr   - registos locais (IndexedDB / localStorage / XLSX)
+ * @param {Array} cloudArr   - registos da nuvem
+ * @returns {{ merged: Array, stats: {inserted:number, updated:number, skipped:number} }}
+ */
+function mergeRecords(localArr, cloudArr) {
+  const stats = { inserted: 0, updated: 0, skipped: 0 };
+  // Indexar nuvem por id
+  const cloudMap = new Map();
+  (cloudArr || []).forEach(r => cloudMap.set(String(r.id), r));
+
+  // Indexar local por id
+  const localMap = new Map();
+  (localArr || []).forEach(r => localMap.set(String(r.id), r));
+
+  // Começar com cópia da nuvem (base)
+  const result = new Map(cloudMap);
+
+  for (const [id, localRec] of localMap) {
+    if (!result.has(id)) {
+      // Não existe na nuvem → INSERT
+      result.set(id, { ...localRec });
+      stats.inserted++;
+    } else {
+      const cloudRec = result.get(id);
+      const localTs  = localRec._updatedAt  ? new Date(localRec._updatedAt).getTime()  : 0;
+      const cloudTs  = cloudRec._updatedAt  ? new Date(cloudRec._updatedAt).getTime() : 0;
+      if (localTs > cloudTs) {
+        // Local é mais recente → UPDATE (mantém ativo:false se foi apagado localmente)
+        result.set(id, { ...cloudRec, ...localRec });
+        stats.updated++;
+      } else {
+        // Nuvem é igual ou mais recente → não alterar (skip)
+        stats.skipped++;
+      }
+    }
+  }
+
+  return { merged: Array.from(result.values()), stats };
+}
+
+/**
+ * Aplica o resultado do merge de volta à BD local (cloud → local).
+ * Não destrói dados locais mais recentes.
+ */
+function mergeCloudIntoLocal(cloudData) {
+  if (!cloudData) return { inserted:0, updated:0, skipped:0 };
+  const totalStats = { inserted:0, updated:0, skipped:0 };
+  SYNC_TABLES.forEach(table => {
+    if (!Array.isArray(cloudData[table])) return;
+    const { merged, stats } = mergeRecords(cloudData[table], db.data[table] || []);
+    // Aqui a "nuvem" é a fonte autoritativa só quando mais recente
+    // então invertemos: local vence se for mais recente, nuvem vence se for mais recente
+    // mergeRecords já faz isso — o resultado merged é o estado correcto
+    db.data[table] = merged;
+    totalStats.inserted += stats.inserted;
+    totalStats.updated  += stats.updated;
+    totalStats.skipped  += stats.skipped;
+  });
+  return totalStats;
+}
+
+/**
+ * Produz o payload a enviar para a nuvem após merge.
+ * Recebe os dados actuais da nuvem e faz merge com os dados locais.
+ * Retorna o objecto mesclado pronto para ser guardado na nuvem.
+ */
+function buildMergedCloudPayload(cloudData) {
+  const result = JSON.parse(JSON.stringify(DEFAULT_DB));
+  SYNC_TABLES.forEach(table => {
+    const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+    const localArr = db.data[table] || [];
+    const { merged } = mergeRecords(localArr, cloudArr);
+    result[table] = merged;
+  });
+  return result;
+}
+
+// ── Sincronizar dados locais → nuvem (MERGE inteligente) ──
 async function syncLocalToCloud() {
   const cfg = getCloudCfg();
   if (!cfg) return;
   try {
-    await CloudDB.saveAll(db.data);
-    await CloudDB.saveUsers(db.data.usuarios);
-    // Pull merged cloud data back
+    toast('info', '☁️ A sincronizar com a nuvem...', 'A ler dados actuais da nuvem...');
+
+    // 1. Ler dados actuais da nuvem (para não os perder)
     const cloudData = await CloudDB.loadAll();
-    if (cloudData) {
-      const localUsers = db.data.usuarios;
-      db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...cloudData };
-      db.data.usuarios = localUsers.length ? localUsers : db.data.usuarios;
-    }
-    // Cache full data locally for offline fallback
+
+    // 2. Fazer merge: local + nuvem → payload final
+    const mergedPayload = buildMergedCloudPayload(cloudData);
+
+    // 3. Contar estatísticas para feedback
+    let totalInserted = 0, totalUpdated = 0;
+    SYNC_TABLES.forEach(table => {
+      const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+      const localArr = db.data[table] || [];
+      const { stats } = mergeRecords(localArr, cloudArr);
+      totalInserted += stats.inserted;
+      totalUpdated  += stats.updated;
+    });
+
+    // 4. Guardar na nuvem (PUT com dados mesclados — NÃO sobrescreve com dados brutos locais)
+    await CloudDB.saveAll(mergedPayload);
+
+    // 5. Actualizar dados locais com o estado mesclado (para ficar em sincronia)
+    const localUsers = db.data.usuarios;
+    db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...mergedPayload };
+    // Preservar utilizadores locais se mais recentes
+    if (localUsers.length && !mergedPayload.usuarios.length) db.data.usuarios = localUsers;
+
+    // 6. Cache local
     try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
       try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:db.data.usuarios})); } catch(e2) {}
     }
-    toast('success', '✅ Sincronizado com a nuvem!', 'Todos os dados foram enviados e actualizados.');
-    // Refresh current page
+    if (getDbMode() === 'indexeddb') saveToIDB(db.data).catch(()=>{});
+
+    toast('success', '✅ Sincronizado com a nuvem!',
+      `Adicionados: ${totalInserted} | Actualizados: ${totalUpdated} | Sem conflito: OK`);
     if (currentPage && typeof navigateTo === 'function') navigateTo(currentPage);
   } catch(e) {
     toast('error', 'Sincronização falhou', 'Verifique a ligação e tente novamente. ' + e.message);
   }
 }
 
-// ── Sincronizar nuvem → dados locais ──
+// ── Sincronizar nuvem → dados locais (MERGE inteligente) ──
 async function syncCloudToLocal() {
   const cfg = getCloudCfg();
   if (!cfg) return;
   try {
-    toast('info', '☁️ A carregar dados da nuvem...');
+    toast('info', '☁️ A carregar dados da nuvem...', 'A fazer merge inteligente...');
     const cloudData = await CloudDB.loadAll();
-    const cloudUsers = await CloudDB.loadUsers();
     if (cloudData) {
-      db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...cloudData };
+      // Merge: nuvem vence apenas onde for mais recente que local
+      const stats = mergeCloudIntoLocal(cloudData);
+      try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
+        try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:db.data.usuarios})); } catch(e2) {}
+      }
+      if (getDbMode() === 'indexeddb') saveToIDB(db.data).catch(()=>{});
+      toast('success', '☁️ Nuvem mesclada com dados locais',
+        `Novos: ${stats.inserted} | Actualizados: ${stats.updated} | Mantidos locais: ${stats.skipped}`);
+    } else {
+      toast('warning', 'Nuvem sem dados', 'Não foram encontrados dados na nuvem para carregar.');
     }
-    if (cloudUsers && cloudUsers.length) {
-      db.data.usuarios = cloudUsers;
-    }
-    try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
-      try { localStorage.setItem(DB_KEY, JSON.stringify({usuarios:db.data.usuarios})); } catch(e2) {}
-    }
-    toast('success', '☁️ Dados da nuvem carregados', 'Base de dados local actualizada com sucesso.');
     if (currentPage && typeof navigateTo === 'function') navigateTo(currentPage);
   } catch(e) {
     toast('warning', 'Carregamento da nuvem falhou', 'A usar dados locais em cache.');
   }
 }
+// ===================== FIM MOTOR DE MERGE INTELIGENTE =====================
 
 // ===================== CLOUD DATABASE (Universal: Firebase / Supabase / REST) =====================
 // Detecta automaticamente o tipo de BD a partir do URL.
@@ -1897,6 +2011,16 @@ const DEFAULT_DB = {
   logs: []             // System activity logs
 };
 
+// Agendador de merge com debounce: evita fazer merge na nuvem em cada save() rápido
+let _mergeCloudTimer = null;
+function _scheduleMergeToCloud() {
+  if (_mergeCloudTimer) clearTimeout(_mergeCloudTimer);
+  _mergeCloudTimer = setTimeout(async () => {
+    _mergeCloudTimer = null;
+    try { await syncLocalToCloud(); } catch(e) { console.warn('[Cloud] merge agendado falhou:', e); }
+  }, 3000); // 3 segundos de debounce
+}
+
 class Database {
   constructor() { this.data = this.load(); }
   load() {
@@ -2000,9 +2124,8 @@ class Database {
     } else if (mode === 'cloud') {
       const cfg = getCloudCfg();
       if (cfg && _isOnline) {
-        // Online: guardar na nuvem
-        CloudDB.saveAll(this.data).catch(e => console.warn('[Cloud] saveAll falhou:', e));
-        CloudDB.saveUsers(this.data.usuarios).catch(e => console.warn('[Cloud] saveUsers falhou:', e));
+        // Online: guardar localmente e agendar merge na nuvem (debounced para não fazer merge em cada tecla)
+        _scheduleMergeToCloud();
       }
       // Sempre manter cache local completa para funcionar offline
       try { localStorage.setItem(DB_KEY, JSON.stringify(this.data)); } catch(e) {
@@ -2049,6 +2172,7 @@ class Database {
   insert(table, item) {
     item.id = this.nextId(table);
     item.ativo = true;
+    item._updatedAt = new Date().toISOString();
     this.data[table].push(item);
     this.save();
     if (table !== 'logs') addLog('insert', table, item.id, item);
@@ -2057,6 +2181,7 @@ class Database {
   update(table, id, updates) {
     const idx = this.data[table].findIndex(r => Number(r.id) === Number(id));
     if (idx === -1) return false;
+    updates._updatedAt = new Date().toISOString();
     this.data[table][idx] = { ...this.data[table][idx], ...updates };
     this.save();
     if (table !== 'logs') addLog('update', table, id, updates);
@@ -2918,7 +3043,7 @@ let prodSearch = '';
 function renderProdutos() {
   const prateleiras = db.getAll('prateleiras');
   let produtos = db.getAll('produtos');
-  if (prodSearch) produtos = produtos.filter(p => p.nome.toLowerCase().includes(prodSearch.toLowerCase()) || (p.grupo_farmacologico||'').toLowerCase().includes(prodSearch.toLowerCase()));
+  if (prodSearch) produtos = produtos.filter(p => p.nome.toLowerCase().includes(prodSearch.toLowerCase()) || (p.grupo_farmacologico||'').toLowerCase().includes(prodSearch.toLowerCase()) || (p.forma||'').toLowerCase().includes(prodSearch.toLowerCase()));
   produtos.sort((a, b) => (a.nome||'').localeCompare(b.nome||'', 'pt', {sensitivity:'base'}));
 
   document.getElementById('page-produtos').innerHTML = `
@@ -2938,7 +3063,7 @@ function renderProdutos() {
         <div class="table-title">${ICONS.list} Lista de Produtos <span class="chip">${produtos.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <input class="search-input" id="search-produtos" placeholder="Pesquisar produto..." value="${prodSearch}" oninput="prodSearch=this.value;filterProdutosTable()">
+            <input class="search-input" id="search-produtos" placeholder="Pesquisar por nome, grupo ou forma..." value="${prodSearch}" oninput="prodSearch=this.value;filterProdutosTable()">
           </div>
         </div>
       </div>
@@ -3413,7 +3538,16 @@ function renderLotes() {
   const produtos = db.getAll('produtos');
   const fornecedores = db.getAll('fornecedores');
   let lotes = db.getAll('lotes');
-  if (loteSearch) lotes = lotes.filter(l => l.numero_lote.toLowerCase().includes(loteSearch.toLowerCase()) || (db.getById('produtos',l.produto_id)?.nome||'').toLowerCase().includes(loteSearch.toLowerCase()));
+  if (loteSearch) lotes = lotes.filter(l => {
+    const _sp = db.getById('produtos', l.produto_id);
+    const _sf = db.getById('fornecedores', l.fornecedor_id);
+    const _sq = loteSearch.toLowerCase();
+    return l.numero_lote.toLowerCase().includes(_sq) ||
+      (_sp?.nome||'').toLowerCase().includes(_sq) ||
+      (_sf?.nome||'').toLowerCase().includes(_sq) ||
+      (_sp?.grupo_farmacologico||'').toLowerCase().includes(_sq) ||
+      (_sp?.forma||'').toLowerCase().includes(_sq);
+  });
   if (loteFilter==='ativos') lotes = lotes.filter(l=>daysUntil(l.validade)>=0);
   if (loteFilter==='avencer') lotes = lotes.filter(l=>{ const d=daysUntil(l.validade); return d>=0&&d<=90; });
   if (loteFilter==='vencidos') lotes = lotes.filter(l=>daysUntil(l.validade)<0);
@@ -3438,9 +3572,9 @@ function renderLotes() {
         <div class="table-title">${ICONS.list} Lotes <span class="chip">${lotes.length}</span></div>
         <div class="table-actions">
           <div class="search-wrap">
-            <input class="search-input" id="search-lotes" placeholder="Pesquisar por lote ou produto..." value="${loteSearch}" oninput="loteSearch=this.value;renderLotesFiltered()">
+            <input class="search-input" id="search-lotes" placeholder="Pesquisar por lote, produto, fornecedor, grupo ou forma..." value="${loteSearch}" oninput="loteSearch=this.value;renderLotesFiltered()">
           </div>
-          <select class="select-filter" onchange="loteFilter=this.value;renderLotesFiltered()">
+          <select class="select-filter" onchange="loteFilter=this.value;renderLotesFiltered(true)">
             <option value="todos" ${loteFilter==='todos'?'selected':''}>Todos</option>
             <option value="ativos" ${loteFilter==='ativos'?'selected':''}>Activos</option>
             <option value="avencer" ${loteFilter==='avencer'?'selected':''}>A Vencer</option>
@@ -4248,8 +4382,8 @@ function renderBaseDados() {
         </div>
         <code style="font-size:10px;opacity:.7;display:block;margin-bottom:8px;word-break:break-all;">${getCloudCfg().url}</code>
         <div style="display:flex;gap:7px;flex-wrap:wrap;">
-          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncLocalToCloud()">⬆ Enviar para Nuvem</button>
-          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncCloudToLocal()">⬇ Carregar da Nuvem</button>
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncLocalToCloud()">⬆ Merge → Nuvem</button>
+          <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="syncCloudToLocal()">⬇ Merge ← Nuvem</button>
           <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;" onclick="testCloudConnectionUI()">Testar Ligação</button>
           <button class="btn btn-secondary" style="font-size:11px;padding:4px 10px;color:#e74c3c;" onclick="disconnectCloud()">Desligar</button>
         </div>
@@ -5613,8 +5747,8 @@ function doGet(e){
         <button class="btn btn-secondary" onclick="testSupabase()" ${syncConfig.supabaseUrl&&syncConfig.supabaseKey?'':'disabled'}>${ICONS.refresh} Testar</button>
       </div>
       <div class="sync-actions" style="margin-top:10px;">
-        <button class="btn btn-danger" onclick="syncToSupabase()" ${syncConfig.supabaseUrl&&syncConfig.supabaseKey?'':'disabled'} style="flex:1;">${ICONS.upload} Enviar → Supabase</button>
-        <button class="btn btn-primary" onclick="syncFromSupabase()" ${syncConfig.supabaseUrl&&syncConfig.supabaseKey?'':'disabled'} style="flex:1;">${ICONS.download} Receber ← Supabase</button>
+        <button class="btn btn-danger" onclick="syncToSupabase()" ${syncConfig.supabaseUrl&&syncConfig.supabaseKey?'':'disabled'} style="flex:1;">${ICONS.upload} Merge → Supabase</button>
+        <button class="btn btn-primary" onclick="syncFromSupabase()" ${syncConfig.supabaseUrl&&syncConfig.supabaseKey?'':'disabled'} style="flex:1;">${ICONS.download} Merge ← Supabase</button>
       </div>
       <details style="margin-top:14px;">
         <summary style="cursor:pointer;font-size:12px;color:#3ECF8E;font-weight:600;">Como configurar o Supabase</summary>
@@ -5663,8 +5797,8 @@ CREATE POLICY "allow_all" ON bandmed_sync FOR ALL USING (true) WITH CHECK (true)
         <button class="btn btn-secondary" onclick="testFirebase()" ${syncConfig.firebaseUrl?'':'disabled'}>${ICONS.refresh} Testar</button>
       </div>
       <div class="sync-actions" style="margin-top:10px;">
-        <button class="btn btn-danger" onclick="syncToFirebase()" ${syncConfig.firebaseUrl?'':'disabled'} style="flex:1;">${ICONS.upload} Enviar → Firebase</button>
-        <button class="btn btn-primary" onclick="syncFromFirebase()" ${syncConfig.firebaseUrl?'':'disabled'} style="flex:1;">${ICONS.download} Receber ← Firebase</button>
+        <button class="btn btn-danger" onclick="syncToFirebase()" ${syncConfig.firebaseUrl?'':'disabled'} style="flex:1;">${ICONS.upload} Merge → Firebase</button>
+        <button class="btn btn-primary" onclick="syncFromFirebase()" ${syncConfig.firebaseUrl?'':'disabled'} style="flex:1;">${ICONS.download} Merge ← Firebase</button>
       </div>
       <details style="margin-top:14px;">
         <summary style="cursor:pointer;font-size:12px;color:#FFA000;font-weight:600;">Como configurar o Firebase</summary>
@@ -5733,29 +5867,56 @@ async function testSupabase() {
 
 async function syncToSupabase() {
   if (!syncConfig.supabaseUrl || !syncConfig.supabaseKey) { toast('error','Configure o Supabase primeiro'); return; }
-  const ok = await confirm('Enviar para Supabase','Os dados do Supabase serão substituídos pelos dados locais. Continuar?');
+  const ok = await confirm('Enviar para Supabase (Merge Inteligente)',
+    'Os dados serão mesclados: novos registos locais serão inseridos, registos mais recentes serão actualizados. Os dados existentes na nuvem com data mais recente NÃO serão sobrescritos. Continuar?');
   if (!ok) return;
-  toast('info','A enviar para Supabase...');
+  toast('info','A fazer merge inteligente com Supabase...','A ler dados actuais...');
   syncConfig.status='syncing'; saveSyncConfig();
   try {
-    const payload = { id:'main', data: JSON.stringify(getExportData()), updated_at: new Date().toISOString() };
+    // 1. Ler dados actuais do Supabase
+    const rGet = await fetch(`${syncConfig.supabaseUrl}/rest/v1/bandmed_sync?id=eq.main&select=data`, {
+      headers:{ 'apikey':syncConfig.supabaseKey, 'Authorization':`Bearer ${syncConfig.supabaseKey}` }
+    });
+    let cloudData = null;
+    if (rGet.ok) {
+      const rows = await rGet.json();
+      if (rows && rows.length && rows[0].data) {
+        try { cloudData = JSON.parse(rows[0].data); } catch(e) { cloudData = rows[0].data; }
+      }
+    }
+    // 2. Merge: local + nuvem
+    const mergedPayload = buildMergedCloudPayload(cloudData);
+    // 3. Estatísticas
+    let totalInserted = 0, totalUpdated = 0;
+    SYNC_TABLES.forEach(table => {
+      const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+      const { stats } = mergeRecords(db.data[table] || [], cloudArr);
+      totalInserted += stats.inserted; totalUpdated += stats.updated;
+    });
+    // 4. Guardar merged na nuvem
+    const payload = { id:'main', data: JSON.stringify(mergedPayload), updated_at: new Date().toISOString() };
     const r = await fetch(`${syncConfig.supabaseUrl}/rest/v1/bandmed_sync`, {
       method:'POST',
       headers:{ 'apikey':syncConfig.supabaseKey, 'Authorization':`Bearer ${syncConfig.supabaseKey}`, 'Content-Type':'application/json', 'Prefer':'resolution=merge-duplicates' },
       body: JSON.stringify(payload)
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    // 5. Actualizar dados locais com o estado mesclado
+    db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...mergedPayload };
+    db.save();
     syncConfig.status='connected'; syncConfig.lastSync=new Date().toLocaleString('pt-AO'); saveSyncConfig();
-    toast('success','Dados enviados para Supabase!');
-  } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro ao enviar para Supabase', e.message); }
+    toast('success',`Merge com Supabase concluído!`, `Inseridos: ${totalInserted} | Actualizados: ${totalUpdated}`);
+    updateAlertBadge();
+  } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro no merge Supabase', e.message); }
   renderSincronizacao();
 }
 
 async function syncFromSupabase() {
   if (!syncConfig.supabaseUrl || !syncConfig.supabaseKey) { toast('error','Configure o Supabase primeiro'); return; }
-  const ok = await confirm('Receber do Supabase','Os dados locais serão substituídos. Continuar?');
+  const ok = await confirm('Receber do Supabase (Merge Inteligente)',
+    'Os dados da nuvem serão mesclados com os dados locais. Registos mais recentes vencem. Nenhum dado local recente será perdido. Continuar?');
   if (!ok) return;
-  toast('info','A receber do Supabase...');
+  toast('info','A receber do Supabase (merge inteligente)...');
   syncConfig.status='syncing'; saveSyncConfig();
   try {
     const r = await fetch(`${syncConfig.supabaseUrl}/rest/v1/bandmed_sync?id=eq.main&select=data`, {
@@ -5764,12 +5925,13 @@ async function syncFromSupabase() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const rows = await r.json();
     if (!rows.length) throw new Error('Sem dados no Supabase. Envie os dados primeiro.');
-    const data = JSON.parse(rows[0].data);
-    const tables=['produtos','fornecedores','prateleiras','lotes','movimentacoes','kits'];
-    tables.forEach(t=>{ if(Array.isArray(data[t])) db.data[t]=data[t]; });
+    let cloudData = rows[0].data;
+    if (typeof cloudData === 'string') { try { cloudData = JSON.parse(cloudData); } catch(e) {} }
+    const stats = mergeCloudIntoLocal(cloudData);
     db.save();
     syncConfig.status='connected'; syncConfig.lastSync=new Date().toLocaleString('pt-AO'); saveSyncConfig();
-    toast('success','Dados recebidos do Supabase!');
+    toast('success','Merge do Supabase concluído!',
+      `Novos: ${stats.inserted} | Actualizados: ${stats.updated} | Mantidos locais: ${stats.skipped}`);
     updateAlertBadge();
   } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro ao receber do Supabase', e.message); }
   renderSincronizacao();
@@ -5797,26 +5959,49 @@ async function testFirebase() {
 
 async function syncToFirebase() {
   if (!syncConfig.firebaseUrl) { toast('error','Configure o Firebase primeiro'); return; }
-  const ok = await confirm('Enviar para Firebase','Os dados do Firebase serão substituídos. Continuar?');
+  const ok = await confirm('Enviar para Firebase (Merge Inteligente)',
+    'Os dados serão mesclados: novos registos locais serão inseridos, registos mais recentes actualizados. Os dados existentes na nuvem com data mais recente NÃO serão sobrescritos. Continuar?');
   if (!ok) return;
-  toast('info','A enviar para Firebase...');
+  toast('info','A fazer merge inteligente com Firebase...','A ler dados actuais...');
   syncConfig.status='syncing'; saveSyncConfig();
   try {
-    const payload = { data: getExportData(), updated_at: Date.now() };
-    const url = `${syncConfig.firebaseUrl}/bandmed_sync.json${syncConfig.firebaseKey?'?auth='+syncConfig.firebaseKey:''}`;
-    const r = await fetch(url, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    // 1. Ler dados actuais do Firebase
+    const urlGet = `${syncConfig.firebaseUrl}/bandmed_sync.json${syncConfig.firebaseKey?'?auth='+syncConfig.firebaseKey:''}`;
+    const rGet = await fetch(urlGet);
+    let cloudData = null;
+    if (rGet.ok) {
+      const payload = await rGet.json();
+      if (payload && payload.data) cloudData = payload.data;
+    }
+    // 2. Merge: local + nuvem
+    const mergedPayload = buildMergedCloudPayload(cloudData);
+    // 3. Estatísticas
+    let totalInserted = 0, totalUpdated = 0;
+    SYNC_TABLES.forEach(table => {
+      const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+      const { stats } = mergeRecords(db.data[table] || [], cloudArr);
+      totalInserted += stats.inserted; totalUpdated += stats.updated;
+    });
+    // 4. Guardar merged na nuvem
+    const urlPut = `${syncConfig.firebaseUrl}/bandmed_sync.json${syncConfig.firebaseKey?'?auth='+syncConfig.firebaseKey:''}`;
+    const r = await fetch(urlPut, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ data: mergedPayload, updated_at: Date.now() }) });
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    // 5. Actualizar dados locais com o estado mesclado
+    db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...mergedPayload };
+    db.save();
     syncConfig.status='connected'; syncConfig.lastSync=new Date().toLocaleString('pt-AO'); saveSyncConfig();
-    toast('success','Dados enviados para Firebase!');
-  } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro ao enviar para Firebase', e.message); }
+    toast('success',`Merge com Firebase concluído!`, `Inseridos: ${totalInserted} | Actualizados: ${totalUpdated}`);
+    updateAlertBadge();
+  } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro no merge Firebase', e.message); }
   renderSincronizacao();
 }
 
 async function syncFromFirebase() {
   if (!syncConfig.firebaseUrl) { toast('error','Configure o Firebase primeiro'); return; }
-  const ok = await confirm('Receber do Firebase','Os dados locais serão substituídos. Continuar?');
+  const ok = await confirm('Receber do Firebase (Merge Inteligente)',
+    'Os dados da nuvem serão mesclados com os dados locais. Registos mais recentes vencem. Nenhum dado local recente será perdido. Continuar?');
   if (!ok) return;
-  toast('info','A receber do Firebase...');
+  toast('info','A receber do Firebase (merge inteligente)...');
   syncConfig.status='syncing'; saveSyncConfig();
   try {
     const url = `${syncConfig.firebaseUrl}/bandmed_sync.json${syncConfig.firebaseKey?'?auth='+syncConfig.firebaseKey:''}`;
@@ -5824,12 +6009,12 @@ async function syncFromFirebase() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const payload = await r.json();
     if (!payload || !payload.data) throw new Error('Sem dados no Firebase. Envie os dados primeiro.');
-    const data = payload.data;
-    const tables=['produtos','fornecedores','prateleiras','lotes','movimentacoes','kits'];
-    tables.forEach(t=>{ if(Array.isArray(data[t])) db.data[t]=data[t]; });
+    const cloudData = payload.data;
+    const stats = mergeCloudIntoLocal(cloudData);
     db.save();
     syncConfig.status='connected'; syncConfig.lastSync=new Date().toLocaleString('pt-AO'); saveSyncConfig();
-    toast('success','Dados recebidos do Firebase!');
+    toast('success','Merge do Firebase concluído!',
+      `Novos: ${stats.inserted} | Actualizados: ${stats.updated} | Mantidos locais: ${stats.skipped}`);
     updateAlertBadge();
   } catch(e) { syncConfig.status='disconnected'; saveSyncConfig(); toast('error','Erro ao receber do Firebase', e.message); }
   renderSincronizacao();
@@ -6423,10 +6608,19 @@ document.addEventListener('DOMContentLoaded', () => {
       // Garantir que o IDB foi pré-carregado antes de decidir o ecrã a mostrar
       await _preloadIDB;
 
+      // Verificar conectividade real (navigator.onLine pode ser falso positivo)
+      let _isReallyOnline = navigator.onLine;
+      if (_isReallyOnline) {
+        try {
+          await fetch('https://www.google.com/generate_204', { method: 'HEAD', mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3000) });
+          _isReallyOnline = true;
+        } catch { _isReallyOnline = false; }
+      }
+
       // Online sem configuração de nuvem: mostrar wizard SEMPRE (mesmo com utilizadores locais)
       // Excepto se o utilizador já ignorou o wizard nesta sessão
       const _wizardSkipped = sessionStorage.getItem('hmm_cloud_wizard_skipped');
-      if (navigator.onLine && !getCloudCfg() && !_wizardSkipped) {
+      if (_isReallyOnline && !getCloudCfg() && !_wizardSkipped) {
         if (db.data.usuarios.length === 0) {
           showScreen('setup'); // por baixo do wizard
           setupFirstRun();
@@ -7098,7 +7292,8 @@ function filterProdutosTable() {
   let produtos = db.getAll('produtos');
   if (prodSearch) produtos = produtos.filter(p =>
     p.nome.toLowerCase().includes(prodSearch.toLowerCase()) ||
-    (p.grupo_farmacologico||'').toLowerCase().includes(prodSearch.toLowerCase())
+    (p.grupo_farmacologico||'').toLowerCase().includes(prodSearch.toLowerCase()) ||
+    (p.forma||'').toLowerCase().includes(prodSearch.toLowerCase())
   );
   produtos.sort((a, b) => (a.nome||'').localeCompare(b.nome||'', 'pt', {sensitivity:'base'}));
 
@@ -7133,26 +7328,27 @@ function filterProdutosTable() {
   if (inp) { const l = inp.value.length; inp.setSelectionRange(l, l); }
 }
 
-function renderLotesFiltered() {
-  filterLotesTable();
-  // Ensure search input retains focus after DOM update
-  requestAnimationFrame(() => {
-    const inp = document.getElementById('search-lotes');
-    if (inp) { inp.focus(); const l = inp.value.length; inp.setSelectionRange(l, l); }
-  });
+function renderLotesFiltered(fromSelect) {
+  filterLotesTable(fromSelect);
 }
 
-function filterLotesTable() {
+function filterLotesTable(fromSelect) {
   // Update only the tbody — the search input stays focused
   const tbody = document.getElementById('tbody-lotes');
   const counter = document.querySelector('#page-lotes .table-title .chip');
   if (!tbody) { renderLotes(); return; }
 
   let lotes = db.getAll('lotes');
-  if (loteSearch) lotes = lotes.filter(l =>
-    l.numero_lote.toLowerCase().includes(loteSearch.toLowerCase()) ||
-    (db.getById('produtos', l.produto_id)?.nome||'').toLowerCase().includes(loteSearch.toLowerCase())
-  );
+  if (loteSearch) lotes = lotes.filter(l => {
+    const _p = db.getById('produtos', l.produto_id);
+    const _f = db.getById('fornecedores', l.fornecedor_id);
+    const _q = loteSearch.toLowerCase();
+    return l.numero_lote.toLowerCase().includes(_q) ||
+      (_p?.nome||'').toLowerCase().includes(_q) ||
+      (_f?.nome||'').toLowerCase().includes(_q) ||
+      (_p?.grupo_farmacologico||'').toLowerCase().includes(_q) ||
+      (_p?.forma||'').toLowerCase().includes(_q);
+  });
   if (loteFilter === 'ativos')   lotes = lotes.filter(l => daysUntil(l.validade) >= 0);
   if (loteFilter === 'avencer')  lotes = lotes.filter(l => { const d = daysUntil(l.validade); return d >= 0 && d <= 90; });
   if (loteFilter === 'vencidos') lotes = lotes.filter(l => daysUntil(l.validade) < 0);
@@ -7191,10 +7387,11 @@ function filterLotesTable() {
     </tr>`;
   }).join('') : `<tr><td colspan="10"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado${loteSearch?' para "<strong>'+loteSearch+'</strong>"':''}</p></div></td></tr>`;
 
-  // Restore focus at end of text
-  const inp = document.getElementById('search-lotes');
-  if (inp && document.activeElement !== inp) { inp.focus(); }
-  if (inp) { setTimeout(()=>{ const l = inp.value.length; inp.setSelectionRange(l, l); }, 0); }
+  // Restore focus to search input only when triggered by typing (not by select)
+  if (!fromSelect) {
+    const inp = document.getElementById('search-lotes');
+    if (inp) { inp.focus(); const l = inp.value.length; inp.setSelectionRange(l, l); }
+  }
 }
 
 // ===================== TABLE-ONLY FILTER: FORNECEDORES =====================
