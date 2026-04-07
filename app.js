@@ -1050,6 +1050,10 @@ const ICONS = {
   filter:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>`,
   box:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>`,
   money:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>`,
+  money_in:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M12 10v4m0 0-2-2m2 2 2-2"/><path d="M6 9h2M16 9h2"/></svg>`,
+  money_out:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M12 14v-4m0 0-2 2m2-2 2 2"/><path d="M6 15h2M16 15h2"/></svg>`,
+  profit:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg>`,
+  kit_box:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/><line x1="8" y1="10" x2="16" y2="10"/></svg>`,
   activity:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
   pie_chart:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>`,
   bar_chart:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`,
@@ -2706,6 +2710,12 @@ function renderDashboard() {
 
   const totalEntradas = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
   const totalSaidas = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA').reduce((s,m)=>s+(Number(m.quantidade)||0),0);
+  // Financial totals
+  const totalGastoEntradas = movs.filter(m=>(m.tipo||'').toUpperCase()==='ENTRADA'&&Number(m.preco)>0).reduce((s,m)=>s+(Number(m.preco)||0)*(Number(m.quantidade)||0),0);
+  const totalGastoSaidas = movs.filter(m=>(m.tipo||'').toUpperCase()==='SAÍDA'&&Number(m.preco)>0).reduce((s,m)=>s+(Number(m.preco)||0)*(Number(m.quantidade)||0),0);
+  const lucroGanho = totalGastoSaidas - totalGastoEntradas;
+  const kits = db.getAll('kits');
+  const totalUsuarios = (db.data.usuarios||[]).length;
   const alerts = getAlerts();
 
   const topProd = produtos.map(p => {
@@ -2725,6 +2735,11 @@ function renderDashboard() {
       ${statCard('Prateleiras',prateleiras.length,'shelf','#9B59B6','155,89,182','Prateleiras activas')}
       ${statCard('Fornecedores',fornecedores.length,'supplier','#F39C12','243,156,18','Fornecedores activos')}
       ${statCard('Alertas',alerts.length,'alert',alerts.length>0?'#E74C3C':'#27AE60',alerts.length>0?'231,76,60':'39,174,96','Alertas activos')}
+      ${statCard('Gastos Entradas (AOA)',formatMoney(totalGastoEntradas),'money_in','#16A085','22,160,133','Total gasto em entradas')}
+      ${statCard('Gastos Saídas (AOA)',formatMoney(totalGastoSaidas),'money_out','#C0392B','192,57,43','Total gasto em saídas')}
+      ${statCard('Lucro Ganho (AOA)',formatMoney(lucroGanho),lucroGanho>=0?'profit':'arrow_down',lucroGanho>=0?'#27AE60':'#E74C3C',lucroGanho>=0?'39,174,96':'231,76,60',lucroGanho>=0?'Resultado positivo':'Resultado negativo')}
+      ${statCard('Kits de Produtos',kits.length,'kit_box','#8E44AD','142,68,173','Kits cadastrados')}
+      ${statCard('Utilizadores',totalUsuarios,'users','#2980B9','41,128,185','Total no sistema')}
     </div>
 
     <!-- CHARTS ROW -->
@@ -3584,7 +3599,7 @@ function renderLotes() {
       </div>
       <div class="tbl-scroll">
       <table>
-        <thead><tr><th>Nº Lote</th><th>Produto</th><th>Fornecedor</th><th>Qtd. Inicial</th><th>Stock Actual</th><th>Validade</th><th>Dias Rest.</th><th>Código Barras</th><th>Status</th><th>Acções</th></tr></thead>
+        <thead><tr><th>Nº Lote</th><th>Produto</th><th>Fornecedor</th><th>Qtd. Inicial</th><th>Stock Actual</th><th>Preço (AOA)</th><th>Validade</th><th>Dias Rest.</th><th>Código Barras</th><th>Status</th><th>Acções</th></tr></thead>
         <tbody id="tbody-lotes">
           ${lotes.length ? lotes.map(l=>{
             const prod=db.getById('produtos',l.produto_id);
@@ -3599,6 +3614,7 @@ function renderLotes() {
               <td>${forn?forn.nome:'—'}</td>
               <td class="font-bold">${l.quantidade||0}</td>
               <td class="font-bold ${stockActual<0?'text-danger':stockActual===0?'text-muted':'text-accent'}">${stockActual}</td>
+              <td class="font-mono">${l.preco?formatMoney(l.preco):'—'}</td>
               <td>${formatDate(l.validade)}</td>
               <td class="${dias<0?'text-danger':dias<=90?'text-warning':'text-accent'}">${dias<0?`Há ${Math.abs(dias)}d`:dias===Infinity?'—':`${dias}d`}</td>
               <td class="font-mono text-muted">${l.codigo_barra||'—'}</td>
@@ -3611,7 +3627,7 @@ function renderLotes() {
                 </div>
               </td>
             </tr>`;
-          }).join('') : `<tr><td colspan="10"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado</p></div></td></tr>`}
+          }).join('') : `<tr><td colspan="11"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado</p></div></td></tr>`}
         </tbody>
       </table>
       </div>
@@ -3652,6 +3668,10 @@ function renderLotes() {
               <input class="field-input" id="lote-validade" type="date">
             </div>
             <div class="field-wrap">
+              <label class="field-label">${ICONS.money} Preço Unitário (AOA)</label>
+              <input class="field-input" id="lote-preco" type="number" min="0" step="0.01" placeholder="Opcional">
+            </div>
+            <div class="field-wrap">
               <label class="field-label">${ICONS.barcode} Código de Barras</label>
               <input class="field-input" id="lote-barcode" placeholder="Ex: 7891234567890">
             </div>
@@ -3681,9 +3701,10 @@ function openLoteModal(id=null) {
       document.getElementById('lote-quantidade').value=l.quantidade||'';
       document.getElementById('lote-validade').value=l.validade||'';
       document.getElementById('lote-barcode').value=l.codigo_barra||'';
+      document.getElementById('lote-preco').value=l.preco||'';
     }
   } else {
-    ['lote-numero','lote-quantidade','lote-validade','lote-barcode'].forEach(i=>document.getElementById(i).value='');
+    ['lote-numero','lote-quantidade','lote-validade','lote-barcode','lote-preco'].forEach(i=>document.getElementById(i).value='');
     document.getElementById('lote-produto').value='';
     document.getElementById('lote-fornecedor').value='';
   }
@@ -3699,12 +3720,14 @@ async function saveLote() {
   setLoading(btn,true);
   await new Promise(r=>setTimeout(r,400));
   const qtd=parseInt(document.getElementById('lote-quantidade').value)||0;
+  const lotePreco=parseFloat(document.getElementById('lote-preco').value)||null;
   const data={
     numero_lote:numero, produto_id:prodId,
     fornecedor_id:parseInt(document.getElementById('lote-fornecedor').value)||null,
     quantidade:qtd,
     validade:document.getElementById('lote-validade').value,
     codigo_barra:document.getElementById('lote-barcode').value,
+    preco:lotePreco,
   };
   if(editingId){
     const oldLote=db.getById('lotes',editingId);
@@ -3715,12 +3738,11 @@ async function saveLote() {
     if(qtd > oldQtd && qtd - oldQtd > 0){
       const diff=qtd-oldQtd;
       const forn=db.getById('fornecedores',data.fornecedor_id);
-      const novoLote=db.getById('lotes',editingId);
       db.insert('movimentacoes',{
         produto_id:prodId, produto_nome: db.getById('produtos',prodId)?.nome||`Produto #${prodId}`, tipo:'ENTRADA',
         lote_id:editingId, quantidade:diff,
         destino:`Entrada automática — Adição ao Lote ${numero}${forn?' (Forn: '+forn.nome+')':''}`,
-        data:today(), preco:null, auto:true,
+        data:today(), preco:lotePreco, auto:true,
         usuario_nome: currentUser?.nome || '',
         usuario_id: currentUser?.id || null,
       });
@@ -3736,7 +3758,7 @@ async function saveLote() {
         produto_id:prodId, produto_nome: db.getById('produtos',prodId)?.nome||`Produto #${prodId}`, tipo:'ENTRADA',
         lote_id:novoLote.id, quantidade:qtd,
         destino:`Entrada automática — Novo Lote ${numero}${forn?' | Forn: '+forn.nome:''}`,
-        data:today(), preco:null, auto:true,
+        data:today(), preco:lotePreco, auto:true,
         usuario_nome: currentUser?.nome || '',
         usuario_id: currentUser?.id || null,
       });
@@ -3991,11 +4013,26 @@ function updateMovLotes() {
   const loteSelect = document.getElementById('mov-lote');
   if (!loteSelect) return;
   const prodLotes = db.getAll('lotes').filter(l=>l.produto_id===prodId).sort((a,b)=>new Date(a.validade)-new Date(b.validade));
-  loteSelect.innerHTML = `<option value="">Seleccionar lote...</option>` +
+  loteSelect.innerHTML = `<option value="" data-preco="">Seleccionar lote...</option>` +
     prodLotes.map(l=>{
       const st=getLotStatus(l.validade);
-      return `<option value="${l.id}">${l.numero_lote} — Val: ${formatDate(l.validade)} (${st.label})</option>`;
+      return `<option value="${l.id}" data-preco="${l.preco||''}">${l.numero_lote} — Val: ${formatDate(l.validade)} (${st.label})</option>`;
     }).join('');
+  // Reset preco when lotes list changes
+  loteSelect.onchange = function() {
+    const sel = this.options[this.selectedIndex];
+    const precoEl = document.getElementById('mov-preco');
+    if (!precoEl) return;
+    const precoLote = sel ? sel.getAttribute('data-preco') : '';
+    if (precoLote) {
+      precoEl.value = precoLote;
+    } else {
+      // Try to fill from produto preco if no lote preco
+      const produtoId = parseInt(document.getElementById('mov-produto').value);
+      const prod = produtoId ? db.getById('produtos', produtoId) : null;
+      precoEl.value = (prod && prod.preco) ? prod.preco : '';
+    }
+  };
 }
 
 function openMovModal(id=null) {
@@ -7278,6 +7315,12 @@ function selectMovCombo(id, nome) {
   if (textInput) textInput.value = nome;
   closeMovCombo();
   updateMovLotes();
+  // Auto-fill preco from produto if available (optional — clears on lote selection)
+  const precoEl = document.getElementById('mov-preco');
+  if (precoEl) {
+    const prod = id ? db.getById('produtos', parseInt(id)) : null;
+    precoEl.value = (prod && prod.preco) ? prod.preco : '';
+  }
 }
 
 // ===================== TABLE-ONLY FILTER FUNCTIONS (no full re-render) =====================
