@@ -770,6 +770,8 @@ tbody td {
 .badge-info::before { background: #3498db; }
 .badge-neutral { background: rgba(255,255,255,0.08); color: var(--text-secondary); }
 .badge-neutral::before { background: var(--text-secondary); }
+.badge-secondary { background: rgba(255,193,7,0.15); color: #ffc107; }
+.badge-secondary::before { background: #ffc107; }
 
 /* ========== BUTTONS ========== */
 .btn {

@@ -1353,13 +1353,17 @@ const SYNC_TABLES = ['produtos','fornecedores','prateleiras','lotes','movimentac
  */
 function mergeRecords(localArr, cloudArr) {
   const stats = { inserted: 0, updated: 0, skipped: 0 };
+  // Filtrar registos inválidos (sem id ou id nulo) antes do merge
+  const safeCloud = (cloudArr || []).filter(r => r != null && r.id != null && r.id !== '');
+  const safeLocal = (localArr  || []).filter(r => r != null && r.id != null && r.id !== '');
+
   // Indexar nuvem por id
   const cloudMap = new Map();
-  (cloudArr || []).forEach(r => cloudMap.set(String(r.id), r));
+  safeCloud.forEach(r => cloudMap.set(String(r.id), r));
 
   // Indexar local por id
   const localMap = new Map();
-  (localArr || []).forEach(r => localMap.set(String(r.id), r));
+  safeLocal.forEach(r => localMap.set(String(r.id), r));
 
   // Começar com cópia da nuvem (base)
   const result = new Map(cloudMap);
@@ -1416,8 +1420,10 @@ function mergeCloudIntoLocal(cloudData) {
 function buildMergedCloudPayload(cloudData) {
   const result = JSON.parse(JSON.stringify(DEFAULT_DB));
   SYNC_TABLES.forEach(table => {
-    const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
-    const localArr = db.data[table] || [];
+    let cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+    // Filtrar nulos e registos sem id (Firebase arrays esparsos)
+    cloudArr = cloudArr.filter(r => r != null && r.id != null && r.id !== '');
+    const localArr = (db.data[table] || []).filter(r => r != null && r.id != null && r.id !== '');
     const { merged } = mergeRecords(localArr, cloudArr);
     result[table] = merged;
   });
@@ -1432,7 +1438,23 @@ async function syncLocalToCloud() {
     toast('info', '☁️ A sincronizar com a nuvem...', 'A ler dados actuais da nuvem...');
 
     // 1. Ler dados actuais da nuvem (para não os perder)
-    const cloudData = await CloudDB.loadAll();
+    let cloudData = null;
+    try { cloudData = await CloudDB.loadAll(); } catch(e) { console.warn('[Sync] loadAll falhou:', e); }
+
+    // Garantir que cloudData tem estrutura válida mesmo se nuvem está vazia
+    if (!cloudData || typeof cloudData !== 'object') cloudData = {};
+    SYNC_TABLES.forEach(t => {
+      if (!Array.isArray(cloudData[t])) cloudData[t] = [];
+      // Filtrar nulos que o Firebase pode guardar em arrays esparsos
+      cloudData[t] = cloudData[t].filter(r => r != null && r.id != null && r.id !== '');
+    });
+
+    // Igualmente limpar dados locais de registos inválidos antes do merge
+    SYNC_TABLES.forEach(t => {
+      if (Array.isArray(db.data[t])) {
+        db.data[t] = db.data[t].filter(r => r != null && r.id != null && r.id !== '');
+      }
+    });
 
     // 2. Fazer merge: local + nuvem → payload final
     const mergedPayload = buildMergedCloudPayload(cloudData);
@@ -1440,20 +1462,20 @@ async function syncLocalToCloud() {
     // 3. Contar estatísticas para feedback
     let totalInserted = 0, totalUpdated = 0;
     SYNC_TABLES.forEach(table => {
-      const cloudArr = (cloudData && Array.isArray(cloudData[table])) ? cloudData[table] : [];
+      const cloudArr = cloudData[table] || [];
       const localArr = db.data[table] || [];
       const { stats } = mergeRecords(localArr, cloudArr);
       totalInserted += stats.inserted;
       totalUpdated  += stats.updated;
     });
 
-    // 4. Guardar na nuvem (PUT com dados mesclados — NÃO sobrescreve com dados brutos locais)
+    // 4. Guardar na nuvem (PUT com dados mesclados)
     await CloudDB.saveAll(mergedPayload);
 
     // 5. Actualizar dados locais com o estado mesclado (para ficar em sincronia)
     const localUsers = db.data.usuarios;
     db.data = { ...JSON.parse(JSON.stringify(DEFAULT_DB)), ...mergedPayload };
-    // Preservar utilizadores locais se mais recentes
+    // Preservar utilizadores locais se não há na nuvem
     if (localUsers.length && !mergedPayload.usuarios.length) db.data.usuarios = localUsers;
 
     // 6. Cache local
@@ -1466,7 +1488,8 @@ async function syncLocalToCloud() {
       `Adicionados: ${totalInserted} | Actualizados: ${totalUpdated} | Sem conflito: OK`);
     if (currentPage && typeof navigateTo === 'function') navigateTo(currentPage);
   } catch(e) {
-    toast('error', 'Sincronização falhou', 'Verifique a ligação e tente novamente. ' + e.message);
+    console.error('[Sync] syncLocalToCloud erro:', e);
+    toast('error', 'Sincronização falhou', 'Verifique a ligação e tente novamente. ' + (e.message || String(e)));
   }
 }
 
@@ -1476,8 +1499,15 @@ async function syncCloudToLocal() {
   if (!cfg) return;
   try {
     toast('info', '☁️ A carregar dados da nuvem...', 'A fazer merge inteligente...');
-    const cloudData = await CloudDB.loadAll();
+    let cloudData = await CloudDB.loadAll();
     if (cloudData) {
+      // Sanitizar dados da nuvem antes do merge (Firebase pode retornar null em arrays esparsos)
+      if (typeof cloudData === 'object') {
+        SYNC_TABLES.forEach(t => {
+          if (!Array.isArray(cloudData[t])) cloudData[t] = cloudData[t] ? Object.values(cloudData[t]).filter(r => r != null) : [];
+          cloudData[t] = cloudData[t].filter(r => r != null && r.id != null && r.id !== '');
+        });
+      }
       // Merge: nuvem vence apenas onde for mais recente que local
       const stats = mergeCloudIntoLocal(cloudData);
       try { localStorage.setItem(DB_KEY, JSON.stringify(db.data)); } catch(e) {
@@ -1577,20 +1607,33 @@ const CloudDB = {
   async loadAll() {
     const cfg = this.cfg;
     try {
+      let raw = null;
       if (cfg.type === 'firebase') {
         const r = await fetch(this._url('bandmed_data'));
         if (!r.ok) return null;
-        return await r.json();
-      }
-      if (cfg.type === 'supabase') {
+        raw = await r.json();
+      } else if (cfg.type === 'supabase') {
         const r = await fetch(this._url('bandmed_store?store_key=eq.data'), { headers: this._head() });
         if (!r.ok) return null;
         const rows = await r.json();
-        return (Array.isArray(rows) && rows.length) ? rows[0].store_value : null;
+        raw = (Array.isArray(rows) && rows.length) ? rows[0].store_value : null;
+      } else {
+        const r = await fetch(this._url('bandmed_data'), { headers: this._head() });
+        if (!r.ok) return null;
+        raw = await r.json();
       }
-      const r = await fetch(this._url('bandmed_data'), { headers: this._head() });
-      if (!r.ok) return null;
-      return await r.json();
+      // Normalizar: Firebase guarda arrays como objectos {0:{...},1:{...}}
+      // Converter qualquer tabela que seja objecto (não-array) em array
+      if (raw && typeof raw === 'object') {
+        const TABLES = ['produtos','fornecedores','prateleiras','lotes','movimentacoes','kits','usuarios','logs'];
+        TABLES.forEach(t => {
+          if (raw[t] != null && !Array.isArray(raw[t]) && typeof raw[t] === 'object') {
+            raw[t] = Object.values(raw[t]).filter(r => r != null);
+          }
+          if (!Array.isArray(raw[t])) raw[t] = [];
+        });
+      }
+      return raw;
     } catch { return null; }
   },
 
@@ -2312,7 +2355,8 @@ function daysUntil(dateStr) {
   if (!dateStr) return Infinity;
   return Math.floor((new Date(dateStr) - new Date()) / 86400000);
 }
-function getLotStatus(validade) {
+function getLotStatus(validade, bloqueado) {
+  if (bloqueado) return { label:'Bloqueado', cls:'badge-secondary' };
   const d = daysUntil(validade);
   if (d < 0) return { label:'Vencido', cls:'badge-danger' };
   if (d <= 90) return { label:'A Vencer', cls:'badge-warning' };
@@ -2668,6 +2712,7 @@ function updateAlertBadge() {
 function getAlerts() {
   const alerts = [];
   db.getAll('lotes').forEach(lot => {
+    if (lot.bloqueado) return; // Lotes bloqueados não geram alertas de validade
     const d = daysUntil(lot.validade);
     const prod = db.getById('produtos', lot.produto_id);
     const name = prod ? prod.nome : `Produto #${lot.produto_id}`;
@@ -3604,10 +3649,10 @@ function renderLotes() {
           ${lotes.length ? lotes.map(l=>{
             const prod=db.getById('produtos',l.produto_id);
             const forn=db.getById('fornecedores',l.fornecedor_id);
-            const st=getLotStatus(l.validade);
+            const isBloqueado = !!l.bloqueado;
+            const st=getLotStatus(l.validade, isBloqueado);
             const dias=daysUntil(l.validade);
             const stockActual = db.getLoteStock(l.id);
-            const isBloqueado = !!l.bloqueado;
             return `<tr style="${isBloqueado?'opacity:0.65;background:var(--bg-tertiary,#f5f5f5);':''}">
               <td class="font-mono text-accent">${l.numero_lote}${isBloqueado?` <span style="color:var(--danger,#dc3545);font-size:10px;">🔒</span>`:''}</td>
               <td class="td-name">${prod?prod.nome:'—'}</td>
@@ -4015,7 +4060,7 @@ function updateMovLotes() {
   const prodLotes = db.getAll('lotes').filter(l=>l.produto_id===prodId).sort((a,b)=>new Date(a.validade)-new Date(b.validade));
   loteSelect.innerHTML = `<option value="" data-preco="">Seleccionar lote...</option>` +
     prodLotes.map(l=>{
-      const st=getLotStatus(l.validade);
+      const st=getLotStatus(l.validade, !!l.bloqueado);
       return `<option value="${l.id}" data-preco="${l.preco||''}">${l.numero_lote} — Val: ${formatDate(l.validade)} (${st.label})</option>`;
     }).join('');
   // Reset preco when lotes list changes
@@ -4097,7 +4142,22 @@ async function saveMov() {
   if(!prodId){toast('error','Produto obrigatório');return;}
   if(!qtd||qtd<1){toast('error','Quantidade inválida');return;}
   // Verificar se o lote está bloqueado
-  const loteIdSel = parseInt(document.getElementById('mov-lote').value)||null;
+  let loteIdSel = parseInt(document.getElementById('mov-lote').value)||null;
+
+  // FIX 3: Auto-selecionar lote com validade mais próxima em Saídas
+  if (!loteIdSel && tipo.toUpperCase() === 'SAÍDA') {
+    const lotesDisponiveis = db.getAll('lotes')
+      .filter(l => l.produto_id === prodId && !l.bloqueado && daysUntil(l.validade) >= 0 && db.getLoteStock(l.id) > 0)
+      .sort((a, b) => new Date(a.validade) - new Date(b.validade));
+    if (lotesDisponiveis.length > 0) {
+      loteIdSel = lotesDisponiveis[0].id;
+      // Actualizar visualmente o select
+      const loteSelectEl = document.getElementById('mov-lote');
+      if (loteSelectEl) loteSelectEl.value = loteIdSel;
+      toast('info', 'Lote auto-seleccionado', `Lote "${lotesDisponiveis[0].numero_lote}" seleccionado automaticamente (validade mais próxima).`);
+    }
+  }
+
   if (loteIdSel) {
     const loteSel = db.getById('lotes', loteIdSel);
     if (loteSel && loteSel.bloqueado) {
@@ -7406,16 +7466,17 @@ function filterLotesTable(fromSelect) {
   tbody.innerHTML = lotes.length ? lotes.map(l => {
     const prod = db.getById('produtos', l.produto_id);
     const forn = db.getById('fornecedores', l.fornecedor_id);
-    const st   = getLotStatus(l.validade);
+    const isBloqueado = !!l.bloqueado;
+    const st   = getLotStatus(l.validade, isBloqueado);
     const dias = daysUntil(l.validade);
     const stockActual = db.getLoteStock(l.id);
-    const isBloqueado = !!l.bloqueado;
     return `<tr style="${isBloqueado?'opacity:0.65;background:var(--bg-tertiary,#f5f5f5);':''}">
       <td class="font-mono text-accent">${l.numero_lote}${isBloqueado?` <span style="color:var(--danger,#dc3545);font-size:10px;">🔒</span>`:''}</td>
       <td class="td-name">${prod ? prod.nome : '—'}</td>
       <td>${forn ? forn.nome : '—'}</td>
       <td class="font-bold">${l.quantidade||0}</td>
       <td class="font-bold ${stockActual<0?'text-danger':stockActual===0?'text-muted':'text-accent'}">${stockActual}</td>
+      <td class="font-mono">${l.preco?formatMoney(l.preco):'—'}</td>
       <td>${formatDate(l.validade)}</td>
       <td class="${dias<0?'text-danger':dias<=90?'text-warning':'text-accent'}">${dias<0?`Há ${Math.abs(dias)}d`:dias===Infinity?'—':`${dias}d`}</td>
       <td class="font-mono text-muted">${l.codigo_barra||'—'}</td>
@@ -7428,7 +7489,7 @@ function filterLotesTable(fromSelect) {
         </div>
       </td>
     </tr>`;
-  }).join('') : `<tr><td colspan="10"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado${loteSearch?' para "<strong>'+loteSearch+'</strong>"':''}</p></div></td></tr>`;
+  }).join('') : `<tr><td colspan="11"><div class="table-empty">${ICONS.lot}<p>Nenhum lote encontrado${loteSearch?' para "<strong>'+loteSearch+'</strong>"':''}</p></div></td></tr>`;
 
   // Restore focus to search input only when triggered by typing (not by select)
   if (!fromSelect) {
