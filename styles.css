@@ -1344,19 +1344,3 @@ body.theme-light #sidebar-overlay { background: rgba(0,0,0,0.4); }
   padding: 4px 0;
 }
 #mov-pagination-bar-bottom { border-bottom: none; border-top: 1px solid var(--border); }
-
-
-/* ── User popup animation ── */
-@keyframes fadeInDown {
-  from { opacity: 0; transform: translateY(-8px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-/* ── Header user — avatar only ── */
-.header-user { cursor: pointer; }
-.header-user-name { display: none !important; }
-
-/* ── Mais sheet item hover ── */
-#mais-sheet-content > div:active {
-  background: var(--bg-hover) !important;
-}
