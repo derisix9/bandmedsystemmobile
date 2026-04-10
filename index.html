@@ -801,13 +801,34 @@ global.BandmedChart = BandmedChart;
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
           <span class="header-notif-badge" id="header-notif-badge" style="display:none;"></span>
         </button>
-        <div id="header-net-badge" style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;font-size:10px;font-weight:600;background:rgba(231,76,60,0.12);color:#e74c3c;border:1px solid rgba(231,76,60,0.25);transition:all .4s;cursor:default;white-space:nowrap;" title="Estado da ligação">
-          <span id="header-net-dot" style="width:6px;height:6px;border-radius:50%;background:#e74c3c;display:inline-block;transition:background .4s;flex-shrink:0;"></span>
-          <span id="header-net-label">Offline</span>
+        <div class="header-user" style="cursor:pointer;position:relative;" id="header-user-btn" title="Perfil do utilizador">
+          <div class="header-user-avatar" id="header-user-avatar" style="position:relative;">AZ
+            <span id="header-avatar-status-dot" style="position:absolute;bottom:1px;right:1px;width:8px;height:8px;border-radius:50%;background:#e74c3c;border:1.5px solid var(--bg-header,#1a2035);display:inline-block;transition:background .4s;"></span>
+          </div>
         </div>
-        <div class="header-user">
-          <div class="header-user-avatar" id="header-user-avatar">AZ</div>
-          <div class="header-user-name" id="header-user-name">Utilizador</div>
+        <!-- User popup panel -->
+        <div id="user-popup" style="display:none;position:fixed;top:56px;right:12px;z-index:9999;background:var(--bg-card);border:1px solid var(--border);border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,0.22);min-width:220px;padding:0;overflow:hidden;animation:fadeInDown .18s ease;">
+          <div style="padding:18px 18px 14px;border-bottom:1px solid var(--border);">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <div id="popup-user-avatar" style="width:44px;height:44px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;flex-shrink:0;">AZ</div>
+              <div>
+                <div id="popup-user-name" style="font-size:14px;font-weight:700;color:var(--text-primary);">Utilizador</div>
+                <div id="popup-user-role" style="font-size:11px;color:var(--text-muted);margin-top:2px;">Função</div>
+              </div>
+            </div>
+          </div>
+          <div style="padding:10px 14px;">
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 6px;border-radius:8px;background:var(--bg-input);">
+              <span id="popup-status-dot" style="width:8px;height:8px;border-radius:50%;background:#e74c3c;display:inline-block;flex-shrink:0;transition:background .4s;"></span>
+              <span id="popup-status-label" style="font-size:12px;font-weight:600;color:var(--text-secondary);">Offline</span>
+            </div>
+          </div>
+          <div style="padding:0 14px 14px;">
+            <button onclick="document.getElementById('user-popup').style.display='none';document.getElementById('sidebar-user')&&document.getElementById('sidebar-user').click();" style="width:100%;padding:9px;border-radius:8px;background:rgba(231,76,60,0.12);color:#e74c3c;border:1px solid rgba(231,76,60,0.2);font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+              Terminar Sessão
+            </button>
+          </div>
         </div>
       </div>
     </header>
@@ -857,6 +878,19 @@ global.BandmedChart = BandmedChart;
     </div>
   </nav>
 
+  <!-- MAIS BOTTOM SHEET -->
+  <div id="mais-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:2100;backdrop-filter:blur(2px);" onclick="closeMaisSheet()"></div>
+  <div id="mais-sheet" style="display:none;position:fixed;bottom:0;left:0;right:0;z-index:2200;background:var(--bg-card);border-radius:20px 20px 0 0;padding:0 0 max(24px,env(safe-area-inset-bottom)) 0;box-shadow:0 -8px 40px rgba(0,0,0,0.22);transform:translateY(100%);transition:transform .3s cubic-bezier(.32,1,.22,1);">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px 12px;">
+      <div style="font-size:15px;font-weight:700;color:var(--text-primary);">Todos os Módulos</div>
+      <button onclick="closeMaisSheet()" style="background:var(--bg-input);border:none;border-radius:50%;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text-muted);">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="width:40px;height:4px;background:var(--border);border-radius:2px;margin:0 auto 16px;"></div>
+    <div id="mais-sheet-content" style="overflow-y:auto;max-height:65vh;padding:0 16px 8px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;"></div>
+  </div>
+
 </div>
 
 <div id="toast-container"></div>
@@ -892,7 +926,99 @@ global.BandmedChart = BandmedChart;
   if(overlay)overlay.addEventListener('click',closeDrawer);
 
   var maisBt=document.getElementById('bottom-nav-mais');
-  if(maisBt)maisBt.addEventListener('click',openDrawer);
+  if(maisBt)maisBt.addEventListener('click',openMaisSheet);
+
+  // ── MAIS SHEET ──────────────────────────────────────────────────
+  var maisOverlay=document.getElementById('mais-overlay');
+  var maisSheet=document.getElementById('mais-sheet');
+
+  // All sidebar sections data
+  var maisSections=[
+    {group:'Principal',items:[
+      {page:'dashboard',label:'Dashboard',svg:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'},
+      {page:'produtos',label:'Produtos',svg:'<path d="M10.5 20H4a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H20a2 2 0 0 1 2 2v3"/><circle cx="18" cy="18" r="4"/>'},
+      {page:'fornecedores',label:'Fornecedores',svg:'<path d="M3 9h18v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9z"/><path d="M3 9V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3"/>'},
+      {page:'prateleiras',label:'Prateleiras',svg:'<rect x="2" y="3" width="20" height="3" rx="1"/><rect x="2" y="10" width="20" height="3" rx="1"/><rect x="2" y="17" width="20" height="3" rx="1"/>'},
+    ]},
+    {group:'Movimentações',items:[
+      {page:'lotes',label:'Lotes',svg:'<path d="M20 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>'},
+      {page:'kits',label:'Kits',svg:'<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'},
+      {page:'movimentacoes',label:'Mov.',svg:'<path d="M7 16V4m0 0L3 8m4-4 4 4"/><path d="M17 8v12m0 0 4-4m-4 4-4-4"/>'},
+    ]},
+    {group:'Sistema',items:[
+      {page:'alertas',label:'Alertas',svg:'<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/>'},
+      {page:'relatorios',label:'Relatórios',svg:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'},
+      {page:'fichastock',label:'Ficha Stock',svg:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/>'},
+      {page:'basedados',label:'Base Dados',svg:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',id:'nav-basedados'},
+    ]},
+    {group:'Administração',items:[
+      {page:'usuarios',label:'Utilizadores',svg:'<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',id:'nav-usuarios'},
+      {page:'logs',label:'Logs',svg:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/>',id:'nav-logs'},
+      {page:'sincronizacao',label:'Sincronizar',svg:'<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',id:'nav-sincronizacao'},
+    ]},
+  ];
+
+  function buildMaisSheet(){
+    var container=document.getElementById('mais-sheet-content');
+    if(!container)return;
+    var html='';
+    maisSections.forEach(function(section){
+      // Section header spanning full 3 columns
+      html+='<div style="grid-column:1/-1;font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;padding:6px 2px 4px;">'+section.group+'</div>';
+      section.items.forEach(function(item){
+        // Check visibility based on id (hidden items stay hidden)
+        var extraStyle='';
+        if(item.id){
+          var el=document.getElementById(item.id);
+          if(el&&el.style.display==='none')extraStyle='opacity:.35;pointer-events:none;';
+        }
+        html+='<div onclick="navigateFromMais(\''+item.page+'\')" style="'+extraStyle+'display:flex;flex-direction:column;align-items:center;gap:7px;padding:14px 6px 12px;background:var(--bg-input);border-radius:12px;cursor:pointer;border:1.5px solid var(--border);transition:background .15s;active:background:var(--bg-hover);" ontouchstart="this.style.background=\'var(--bg-hover)\'" ontouchend="this.style.background=\'var(--bg-input)\'">'
+          +'<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+item.svg+'</svg>'
+          +'<span style="font-size:10px;font-weight:600;color:var(--text-primary);text-align:center;line-height:1.2;">'+item.label+'</span>'
+          +'</div>';
+      });
+    });
+    container.innerHTML=html;
+  }
+
+  window.navigateFromMais=function(page){
+    closeMaisSheet();
+    setTimeout(function(){
+      var sidebarItem=document.querySelector('#sidebar .nav-item[data-page="'+page+'"]');
+      if(sidebarItem)sidebarItem.click();
+    },320);
+  };
+
+  window.openMaisSheet=function(){
+    buildMaisSheet();
+    maisOverlay.style.display='block';
+    maisSheet.style.display='block';
+    setTimeout(function(){maisSheet.style.transform='translateY(0)';},10);
+    document.body.style.overflow='hidden';
+  };
+  window.closeMaisSheet=function(){
+    maisSheet.style.transform='translateY(100%)';
+    setTimeout(function(){
+      maisOverlay.style.display='none';
+      maisSheet.style.display='none';
+      document.body.style.overflow='';
+    },300);
+  };
+  // ────────────────────────────────────────────────────────────────
+
+  // ── USER POPUP ───────────────────────────────────────────────────
+  var userBtn=document.getElementById('header-user-btn');
+  var userPopup=document.getElementById('user-popup');
+  if(userBtn)userBtn.addEventListener('click',function(e){
+    e.stopPropagation();
+    var isOpen=userPopup.style.display!=='none';
+    userPopup.style.display=isOpen?'none':'block';
+  });
+  document.addEventListener('click',function(){
+    if(userPopup)userPopup.style.display='none';
+  });
+  if(userPopup)userPopup.addEventListener('click',function(e){e.stopPropagation();});
+  // ────────────────────────────────────────────────────────────────
 
   document.querySelectorAll('#sidebar .nav-item[data-page]').forEach(function(item){
     item.addEventListener('click',function(){setTimeout(closeDrawer,180);});

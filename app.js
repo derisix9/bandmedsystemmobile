@@ -1288,7 +1288,15 @@ function updateNetworkStatusUI() {
     else hLabel.textContent = 'Offline';
   }
 
-  // ── Login screen status ──
+  // ── Avatar status dot + popup ──
+  const avatarDot = document.getElementById('header-avatar-status-dot');
+  const popupDot  = document.getElementById('popup-status-dot');
+  const popupLbl  = document.getElementById('popup-status-label');
+  let statusText = online ? 'Online' : 'Offline';
+  if (online && cfg && getDbMode && getDbMode()==='cloud') statusText = 'Online · ' + cloudDbTypeName(cfg.type);
+  if (avatarDot) { avatarDot.style.background = color; avatarDot.style.boxShadow = '0 0 5px '+color+'88'; }
+  if (popupDot)  { popupDot.style.background = color; popupDot.style.boxShadow = '0 0 5px '+color+'88'; }
+  if (popupLbl)  { popupLbl.textContent = statusText; popupLbl.style.color = color; }
   const lDot   = document.getElementById('login-net-dot');
   const lLabel = document.getElementById('login-net-label');
   const lWrap  = document.getElementById('login-net-status');
@@ -2575,6 +2583,13 @@ function initApp() {
   setEl('sidebar-user-name',  currentUser.nome);
   setEl('sidebar-user-role',  currentUser.funcao);
   setEl('sidebar-user-avatar',initials(currentUser.nome));
+  setEl('popup-user-name',    currentUser.nome);
+  setEl('popup-user-role',    currentUser.funcao);
+  setEl('popup-user-avatar',  initials(currentUser.nome));
+  // Popup user info
+  setEl('popup-user-name',    currentUser.nome);
+  setEl('popup-user-role',    currentUser.funcao);
+  setEl('popup-user-avatar',  initials(currentUser.nome));
   // Atualizar badge de rede no header ao entrar na app
   updateNetworkStatusUI();
 
@@ -2866,17 +2881,19 @@ function renderDashboard() {
       </div>
       <div>
         <div class="dash-section-title">${ICONS.alert} Alertas Recentes</div>
-        <div class="table-wrap">
-          ${alerts.slice(0,5).map(a => `
-            <div class="alert-item">
-              <div class="alert-icon ${a.type}">${ICONS[a.icon]||ICONS.alert}</div>
-              <div class="alert-content">
-                <div class="alert-title">${a.title}</div>
-                <div class="alert-desc">${a.desc}</div>
-                <div class="alert-time">${a.time}</div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          ${alerts.slice(0,5).map(a => {
+            const colorMap = {warning:'#f59e0b',danger:'#ef4444',info:'#3b82f6',success:'#22c55e'};
+            const c = colorMap[a.type] || '#6b7280';
+            return `<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;gap:12px;align-items:flex-start;border-left:3px solid ${c};">
+              <div style="width:32px;height:32px;border-radius:50%;background:${c}22;color:${c};display:flex;align-items:center;justify-content:center;flex-shrink:0;">${ICONS[a.icon]||ICONS.alert}</div>
+              <div style="flex:1;min-width:0;">
+                <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:3px;">${a.title}</div>
+                <div style="font-size:12px;color:var(--text-secondary);line-height:1.35;">${a.desc}</div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">${a.time}</div>
               </div>
-            </div>
-          `).join('') || `<div class="table-empty">${ICONS.check}<p>Sem alertas activos</p></div>`}
+            </div>`;
+          }).join('') || `<div class="table-empty">${ICONS.check}<p>Sem alertas activos</p></div>`}
         </div>
       </div>
     </div>
@@ -7174,58 +7191,47 @@ function renderLogs() {
       </div>
     </div>
 
-    <!-- TABLE -->
+    <!-- CARDS (mobile) -->
     <div class="table-wrap">
       <div class="table-header">
         <div class="table-title">${ICONS.activity} Registos <span class="chip">${filtered.length}</span></div>
-        <div class="logs-page-info" style="font-size:13px;color:var(--text-muted);">Página ${logsPage} de ${totalPages} &nbsp;·&nbsp; A mostrar ${paginated.length} de ${total}</div>
+        <div class="logs-page-info" style="font-size:13px;color:var(--text-muted);">Pág. ${logsPage}/${totalPages} · ${paginated.length} de ${total}</div>
       </div>
       ${paginated.length ? `
-      <table class="data-table">
-        <thead><tr>
-          <th style="width:140px;">Data / Hora</th>
-          <th style="width:110px;">Acção</th>
-          <th style="width:120px;">Módulo</th>
-          <th>Descrição</th>
-          <th style="width:130px;">Utilizador</th>
-        </tr></thead>
-        <tbody>
-          ${paginated.map(l => {
-            const isDelete = l.action === 'update' && l.details && l.details.includes('"ativo":false');
-            const actionKey = isDelete ? 'remove' : l.action;
-            const color = actionBadgeColor(actionKey);
-            const aLabel = isDelete ? 'Eliminação' : (ACTION_LABELS[l.action] || l.action);
-            return `<tr>
-              <td><span style="font-size:12px;color:var(--text-muted);">${l.date}</span><br><span style="font-size:11px;color:var(--text-muted);opacity:.7;">${l.time}</span></td>
-              <td>
-                <span style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;background:${color}22;color:${color};white-space:nowrap;">
-                  <span style="width:12px;height:12px;display:inline-flex;">${actionIcon(actionKey)}</span>${aLabel}
-                </span>
-              </td>
-              <td>
-                ${l.module ? `<span style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text-secondary);">
-                  <span style="width:14px;height:14px;display:inline-flex;opacity:.6;">${moduleIcon(l.module)}</span>${l.module_label||l.module}
-                </span>` : '<span style="color:var(--text-muted);font-size:12px;">—</span>'}
-              </td>
-              <td style="font-size:13px;color:var(--text-primary);max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${(l.description||'').replace(/"/g,'&quot;')}">${l.description || '—'}</td>
-              <td>
-                <div style="display:flex;align-items:center;gap:8px;">
-                  <div style="width:28px;height:28px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;">${(l.user_name||'S').split(' ').map(w=>w[0]).slice(0,2).join('').toUpperCase()}</div>
-                  <div><div style="font-size:12px;font-weight:500;color:var(--text-primary)">${l.user_name||'Sistema'}</div>${l.user_role?`<div style="font-size:10px;color:var(--text-muted)">${l.user_role}</div>`:''}</div>
-                </div>
-              </td>
-            </tr>`;
-          }).join('')}
-        </tbody>
-      </table>
+      <div style="display:flex;flex-direction:column;gap:10px;padding:12px;">
+        ${paginated.map(l => {
+          const isDelete = l.action === 'update' && l.details && l.details.includes('"ativo":false');
+          const actionKey = isDelete ? 'remove' : l.action;
+          const color = actionBadgeColor(actionKey);
+          const aLabel = isDelete ? 'Eliminação' : (ACTION_LABELS[l.action] || l.action);
+          return `<div style="background:var(--bg-input);border:1px solid var(--border);border-radius:12px;padding:14px;border-left:3px solid ${color};">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:4px;">
+              <span style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700;background:${color}22;color:${color};">
+                <span style="width:12px;height:12px;display:inline-flex;">${actionIcon(actionKey)}</span>${aLabel}
+              </span>
+              <span style="font-size:11px;color:var(--text-muted);">${l.date} ${l.time}</span>
+            </div>
+            <div style="font-size:13px;color:var(--text-primary);margin-bottom:8px;line-height:1.4;">${l.description || '—'}</div>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;">
+              ${l.module ? `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--text-muted);background:var(--bg-card);padding:3px 8px;border-radius:6px;border:1px solid var(--border);">
+                <span style="width:13px;height:13px;display:inline-flex;opacity:.6;">${moduleIcon(l.module)}</span>${l.module_label||l.module}
+              </span>` : '<span></span>'}
+              <div style="display:flex;align-items:center;gap:6px;">
+                <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0;">${(l.user_name||'S').split(' ').map(w=>w[0]).slice(0,2).join('').toUpperCase()}</div>
+                <span style="font-size:11px;font-weight:500;color:var(--text-secondary);">${l.user_name||'Sistema'}${l.user_role ? '<span style="color:var(--text-muted);font-size:10px;"> · '+l.user_role+'</span>' : ''}</span>
+              </div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
       <!-- PAGINATION -->
-      <div class="logs-pagination" style="display:flex;justify-content:center;align-items:center;gap:8px;padding:16px;">
+      <div class="logs-pagination" style="display:flex;justify-content:center;align-items:center;gap:8px;padding:16px;flex-wrap:wrap;">
         <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px;" onclick="logsPage=${logsPage-1};renderLogs()" ${logsPage<=1?'disabled':''}>← Anterior</button>
-        ${Array.from({length:Math.min(totalPages,7)},(_,i)=>{
-          let p; if(totalPages<=7){p=i+1;}
-          else if(logsPage<=4){p=i+1;}
-          else if(logsPage>=totalPages-3){p=totalPages-6+i;}
-          else{p=logsPage-3+i;}
+        ${Array.from({length:Math.min(totalPages,5)},(_,i)=>{
+          let p; if(totalPages<=5){p=i+1;}
+          else if(logsPage<=3){p=i+1;}
+          else if(logsPage>=totalPages-2){p=totalPages-4+i;}
+          else{p=logsPage-2+i;}
           return `<button class="btn ${p===logsPage?'btn-primary':'btn-secondary'}" style="padding:6px 12px;font-size:12px;min-width:36px;" onclick="logsPage=${p};renderLogs()">${p}</button>`;
         }).join('')}
         <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px;" onclick="logsPage=${logsPage+1};renderLogs()" ${logsPage>=totalPages?'disabled':''}>Seguinte →</button>
@@ -7579,8 +7585,10 @@ function filterKitsTable() {
 
 // ===================== TABLE-ONLY FILTER: LOGS =====================
 function filterLogsTable() {
+  // Cards layout — always do full render for correct card updates
+  renderLogs();
+  return;
   const page = document.getElementById('page-logs');
-  // Logs uses pagination — if shell not ready, do full render
   if (!page || !page.dataset.shellReady) { renderLogs(); return; }
 
   const allLogs = (db.data.logs || []).slice().reverse();
